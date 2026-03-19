@@ -8,6 +8,7 @@ import uuid
 import ray
 import torch
 import numpy as np
+from typing import Optional
 from collections import defaultdict
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -26,6 +27,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from ragen.trainer.core_algos import compute_grpo_outcome_advantage
+from ragen.trainer.core_algos import compute_turn_gae_advantage_return
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -49,12 +51,41 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer as VerlRayPPOTrainer
 
 import torch
 from verl.utils.torch_functional import masked_mean
+from transformers import AutoTokenizer
 
 from ragen.llm_agent.agent_proxy import LLMAgentProxy
 from ragen.utils import GenerationsLogger
 from ragen.trainer.rollout_filter import build_rollout_filter
+from ragen.trainer.generative_critic import FrozenGenerativeCritic
 
 from tensordict import TensorDict
+
+
+def _build_left_padded_tensors(tokenizer, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left", truncation=False)
+    input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
+    position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+    return input_ids, attention_mask, position_ids
+
+
+def _apply_chat_template_batch(tokenizer, texts: list[str], use_chat_template: bool = True) -> list[str]:
+    if not use_chat_template:
+        return texts
+
+    formatted_texts: list[str] = []
+    for text in texts:
+        messages = [{"role": "user", "content": text}]
+        try:
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=False,
+            )
+        except Exception:
+            formatted = text
+        formatted_texts.append(formatted)
+    return formatted_texts
 
 
 def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> DataProto:
@@ -151,6 +182,17 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 lam=lam,
                 high_level_gamma=high_level_gamma,
             )
+        elif "turn_value_mask" in data.batch and "turn_ids" in data.batch and "turn_value_ids" in data.batch:
+            advantages, returns = compute_turn_gae_advantage_return(
+                token_level_rewards=data.batch["token_level_rewards"],
+                values=data.batch["values"],
+                response_mask=data.batch["response_mask"],
+                turn_ids=data.batch["turn_ids"],
+                turn_value_mask=data.batch["turn_value_mask"],
+                turn_value_ids=data.batch["turn_value_ids"],
+                gamma=gamma,
+                lam=lam,
+            )
         else:
             advantages, returns = core_algos.compute_gae_advantage_return(
                 token_level_rewards=data.batch["token_level_rewards"],
@@ -239,6 +281,513 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         self.ref_in_actor = config.actor_rollout_ref.model.get('lora_rank', 0) > 0
         # do not use the original val logger, but use this here
         self.generations_logger = GenerationsLogger()
+        self.generative_critic = FrozenGenerativeCritic(config)
+        self.use_trainable_generative_critic = bool(
+            OmegaConf.select(config, "generative_critic.train_enable", default=False)
+        )
+        self.generative_critic_train_tokenizer = self.tokenizer
+
+        if self.use_trainable_generative_critic:
+            actor_model_path = OmegaConf.select(
+                config,
+                "actor_rollout_ref.model.path",
+                default=OmegaConf.select(config, "model_path", default=None),
+            )
+            train_model_path = OmegaConf.select(config, "generative_critic.train_model_path", default=actor_model_path)
+            if train_model_path is not None and actor_model_path is not None and train_model_path != actor_model_path:
+                trust_remote_code = bool(
+                    OmegaConf.select(config, "generative_critic.trust_remote_code", default=True)
+                )
+                self.generative_critic_train_tokenizer = AutoTokenizer.from_pretrained(
+                    train_model_path,
+                    trust_remote_code=trust_remote_code,
+                )
+                self.generative_critic_train_tokenizer.padding_side = "left"
+                if self.generative_critic_train_tokenizer.pad_token_id is None:
+                    self.generative_critic_train_tokenizer.pad_token = self.generative_critic_train_tokenizer.eos_token
+                print(
+                    "[GEN_CRITIC INIT] loaded dedicated critic tokenizer "
+                    f"train_model_path={train_model_path} actor_model_path={actor_model_path}"
+                )
+
+    def _generate_with_actor_rollout_vllm(self, prompts: list[str], sampling_overrides: dict) -> list[str]:
+        """Reuse actor rollout vLLM engine for generative-critic inference."""
+        if len(prompts) == 0:
+            return []
+
+        if not hasattr(self, "agent_proxy") or self.agent_proxy is None:
+            raise RuntimeError("agent_proxy is not initialized before generative critic inference")
+
+        actor_wg = self.agent_proxy.actor_wg
+        if not hasattr(actor_wg, "generate_sequences"):
+            raise RuntimeError("actor worker group has no generate_sequences for vLLM reuse")
+
+        use_chat_template = bool(OmegaConf.select(self.config, "generative_critic.use_chat_template", default=True))
+        formatted_prompts = _apply_chat_template_batch(self.tokenizer, prompts, use_chat_template=use_chat_template)
+        input_ids, attention_mask, position_ids = _build_left_padded_tensors(self.tokenizer, formatted_prompts)
+
+        lm_inputs = DataProto()
+        lm_inputs.batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": input_ids[:, 1:],
+            },
+            batch_size=input_ids.shape[0],
+        )
+        lm_inputs.non_tensor_batch = {
+            "env_ids": np.arange(len(prompts), dtype=int),
+            "group_ids": np.zeros(len(prompts), dtype=int),
+        }
+
+        val_kwargs = OmegaConf.to_container(self.config.actor_rollout_ref.rollout.val_kwargs, resolve=True)
+        do_sample = bool(sampling_overrides.get("do_sample", False))
+        temperature = float(sampling_overrides.get("temperature", 0.0))
+        top_p = float(sampling_overrides.get("top_p", 1.0))
+        top_k = int(sampling_overrides.get("top_k", -1))
+        max_tokens = int(sampling_overrides.get("max_tokens", 128))
+
+        # Keep do_sample=True so vLLM rollout will not override kwargs,
+        # and emulate greedy decoding with temperature=0 when needed.
+        if not do_sample:
+            temperature = 0.0
+            top_p = 1.0
+            top_k = -1
+
+        sampling_kwargs = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "n": 1,
+        }
+        lm_inputs.meta_info = {
+            "mode": "singleturn",
+            "skip_generation": False,
+            "do_sample": True,
+            "validate": False,
+            "sampling_kwargs": sampling_kwargs,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        lm_outputs = self.agent_proxy.generate_sequences(lm_inputs)
+
+        if lm_outputs.batch is not None and "responses" in lm_outputs.batch.keys():
+            return self.tokenizer.batch_decode(lm_outputs.batch["responses"], skip_special_tokens=True)
+        if "response_texts" in lm_outputs.non_tensor_batch:
+            return lm_outputs.non_tensor_batch["response_texts"].tolist()
+        raise RuntimeError("vLLM generative critic path cannot find responses in output")
+
+    @staticmethod
+    def _compute_outcome_tensor(token_level_scores: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+        """Broadcast per-trajectory outcome score to all response tokens."""
+        outcome = (token_level_scores * response_mask).sum(dim=-1, keepdim=True)
+        return outcome * response_mask
+
+    def _build_generative_critic_prompt_batch(self, prompts: list[str]) -> DataProto:
+        critic_tokenizer = self.generative_critic_train_tokenizer
+        use_chat_template = bool(OmegaConf.select(self.config, "generative_critic.use_chat_template", default=True))
+        formatted_prompts = _apply_chat_template_batch(critic_tokenizer, prompts, use_chat_template=use_chat_template)
+        input_ids, attention_mask, position_ids = _build_left_padded_tensors(critic_tokenizer, formatted_prompts)
+
+        batch = DataProto()
+        batch.batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": input_ids[:, 1:],
+            },
+            batch_size=input_ids.shape[0],
+        )
+        batch.non_tensor_batch = {
+            "env_ids": np.arange(len(prompts), dtype=int),
+            "group_ids": np.zeros(len(prompts), dtype=int),
+            "uid": np.arange(len(prompts), dtype=int),
+        }
+
+        train_temperature = float(OmegaConf.select(self.config, "generative_critic.train_temperature", default=1.0))
+        train_max_new_tokens = int(OmegaConf.select(self.config, "generative_critic.train_max_new_tokens", default=256))
+        train_top_p = float(
+            OmegaConf.select(
+                self.config,
+                "generative_critic.train_top_p",
+                default=OmegaConf.select(self.config, "generative_critic.top_p", default=1.0),
+            )
+        )
+        train_top_k = int(
+            OmegaConf.select(
+                self.config,
+                "generative_critic.train_top_k",
+                default=OmegaConf.select(self.config, "generative_critic.top_k", default=-1),
+            )
+        )
+
+        batch.meta_info = {
+            "mode": "singleturn",
+            "skip_generation": False,
+            "do_sample": True,
+            "validate": False,
+            "sampling_kwargs": {
+                "max_tokens": train_max_new_tokens,
+                "temperature": train_temperature,
+                "top_p": train_top_p,
+                "top_k": train_top_k,
+                "n": 1,
+            },
+            "eos_token_id": critic_tokenizer.eos_token_id,
+            "pad_token_id": critic_tokenizer.pad_token_id,
+            "temperature": train_temperature,
+        }
+        return batch
+
+    def _infer_labels_with_trainable_critic(
+        self,
+        messages_list: list[list[dict]],
+        turn_ids: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict, float]:
+        """Use trainable critic worker (current parameters) to label actor actions."""
+        if turn_ids is None:
+            return torch.zeros(0), {
+                "gen_critic/enabled": 1.0,
+                "gen_critic/used_trainable_critic": 1.0,
+                "gen_critic/num_prompts": 0.0,
+                "gen_critic/parse_fail_rate": 1.0,
+                "gen_critic/true_rate": 0.0,
+            }, 0.0
+
+        label_tensor = torch.zeros_like(turn_ids, dtype=torch.float32)
+
+        # Build prompt items from current trajectory content.
+        prompt_items = self.generative_critic.build_judge_prompts(messages_list=messages_list, turn_ids=turn_ids)
+        if len(prompt_items) == 0:
+            return label_tensor, {
+                "gen_critic/enabled": 1.0,
+                "gen_critic/used_trainable_critic": 1.0,
+                "gen_critic/num_prompts": 0.0,
+                "gen_critic/parse_fail_rate": 0.0,
+                "gen_critic/true_rate": 0.0,
+            }, 0.0
+
+        prompts = [item.prompt for item in prompt_items]
+        gen_inputs = self._build_generative_critic_prompt_batch(prompts)
+        worker_divisor = int(self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes)
+        gen_inputs, pad_size = pad_dataproto_to_divisor(gen_inputs, size_divisor=worker_divisor)
+        critic_gen_start = time.time()
+        critic_rollout = self.critic_wg.generate_critic_sequences(gen_inputs)
+        critic_gen_time = time.time() - critic_gen_start
+        critic_rollout = unpad_dataproto(critic_rollout, pad_size)
+
+        if critic_rollout.batch is not None and "responses" in critic_rollout.batch.keys():
+            outputs = self.generative_critic_train_tokenizer.batch_decode(
+                critic_rollout.batch["responses"],
+                skip_special_tokens=True,
+            )
+        elif "response_texts" in critic_rollout.non_tensor_batch:
+            outputs = critic_rollout.non_tensor_batch["response_texts"].tolist()
+        else:
+            raise RuntimeError("Trainable critic inference output has no textual responses")
+
+        parse_fail = 0
+        true_count = 0
+        for item, text in zip(prompt_items, outputs, strict=True):
+            parsed = self.generative_critic.parse_label(text)
+            if parsed is None:
+                parse_fail += 1
+                parsed = self.generative_critic.default_label_if_parse_fail
+
+            value = 1.0 if parsed else 0.0
+            if value > 0.5:
+                true_count += 1
+            mask = turn_ids[item.sample_index] == item.turn_id
+            label_tensor[item.sample_index, mask] = value
+
+        n = float(len(prompt_items))
+        metrics = {
+            "gen_critic/enabled": 1.0,
+            "gen_critic/used_trainable_critic": 1.0,
+            "gen_critic/num_prompts": n,
+            "gen_critic/parse_fail_rate": float(parse_fail) / max(n, 1.0),
+            "gen_critic/true_rate": float(true_count) / max(n, 1.0),
+        }
+        return label_tensor, metrics, critic_gen_time
+
+    def _train_generative_critic_rlvr(self, actor_batch: DataProto) -> tuple[dict, float]:
+        if "messages_list" not in actor_batch.non_tensor_batch:
+            return {"gen_critic/train/skipped_missing_fields": 1.0}, 0.0
+
+        messages_list = actor_batch.non_tensor_batch["messages_list"].tolist()
+        if "trajectory_success" in actor_batch.non_tensor_batch:
+            trajectory_success = torch.tensor(
+                actor_batch.non_tensor_batch["trajectory_success"],
+                dtype=torch.float32,
+            ) > 0.5
+            success_source = "trajectory_success_field"
+        else:
+            trajectory_success = self.generative_critic.trajectory_success_from_metrics(messages_list)
+
+        if trajectory_success is None:
+            if "token_level_scores" not in actor_batch.batch.keys() and "rm_scores" in actor_batch.batch.keys():
+                actor_batch.batch["token_level_scores"] = actor_batch.batch["rm_scores"]
+            trajectory_success = self.generative_critic.trajectory_success_from_scores(
+                token_level_scores=actor_batch.batch["token_level_scores"],
+                response_mask=actor_batch.batch["response_mask"],
+            )
+            success_source = "score_fallback"
+        elif "trajectory_success" not in actor_batch.non_tensor_batch:
+            success_source = "metrics"
+
+        train_items = self.generative_critic.build_train_judge_prompts(
+            messages_list=messages_list,
+            turn_ids=actor_batch.batch["turn_ids"] if "turn_ids" in actor_batch.batch else None,
+            trajectory_success=trajectory_success,
+        )
+        if len(train_items) == 0:
+            return {"gen_critic/train/num_samples": 0.0}, 0.0
+
+        prompts = [item.prompt for item in train_items]
+        targets = [item.target_label for item in train_items]
+        gen_inputs = self._build_generative_critic_prompt_batch(prompts)
+
+        worker_divisor = int(self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes)
+        gen_inputs, pad_size = pad_dataproto_to_divisor(gen_inputs, size_divisor=worker_divisor)
+        critic_gen_start = time.time()
+        critic_rollout = self.critic_wg.generate_critic_sequences(gen_inputs)
+        critic_gen_time = time.time() - critic_gen_start
+        critic_rollout = unpad_dataproto(critic_rollout, pad_size)
+        if critic_rollout.batch is not None and "responses" in critic_rollout.batch.keys():
+            outputs = self.generative_critic_train_tokenizer.batch_decode(
+                critic_rollout.batch["responses"],
+                skip_special_tokens=True,
+            )
+        elif "response_texts" in critic_rollout.non_tensor_batch:
+            outputs = critic_rollout.non_tensor_batch["response_texts"].tolist()
+        else:
+            raise RuntimeError("Generative critic rollout output has no textual responses")
+
+        scalar_rewards, rlvr_metrics = self.generative_critic.compute_rlvr_scalar_rewards(outputs=outputs, targets=targets)
+
+        # Confusion matrix counts for critic predictions vs ground-truth labels.
+        # rows: predict {true,false}, cols: target {true,false}
+        pred_true_target_true = 0
+        pred_true_target_false = 0
+        pred_false_target_true = 0
+        pred_false_target_false = 0
+        valid_confusion_samples = 0
+        for text, target in zip(outputs, targets, strict=True):
+            if not self.generative_critic.has_strict_label_format(text):
+                continue
+            pred = self.generative_critic.parse_label(text)
+            if pred is None:
+                continue
+            valid_confusion_samples += 1
+            if pred and target:
+                pred_true_target_true += 1
+            elif pred and (not target):
+                pred_true_target_false += 1
+            elif (not pred) and target:
+                pred_false_target_true += 1
+            else:
+                pred_false_target_false += 1
+
+        response_mask = compute_response_mask(critic_rollout)
+        critic_rollout.batch["response_mask"] = response_mask
+        token_rewards = self.generative_critic.expand_scalar_rewards_to_token(
+            scalar_rewards=scalar_rewards,
+            response_mask=response_mask,
+        )
+        critic_rollout.batch["token_level_rewards"] = token_rewards
+        critic_rollout.batch["advantages"] = token_rewards
+        critic_rollout.batch["returns"] = token_rewards
+
+        critic_rollout, pad_size = pad_dataproto_to_divisor(critic_rollout, size_divisor=worker_divisor)
+        old_log_prob = self.critic_wg.compute_critic_log_prob(critic_rollout)
+        critic_entropy = None
+        if "entropys" in old_log_prob.batch.keys():
+            padded_response_mask = critic_rollout.batch["response_mask"]
+            entropy_agg = agg_loss(
+                loss_mat=old_log_prob.batch["entropys"],
+                loss_mask=padded_response_mask,
+                loss_agg_mode=self.config.actor_rollout_ref.actor.loss_agg_mode,
+            )
+            critic_entropy = float(entropy_agg.detach().item())
+            old_log_prob.batch.pop("entropys")
+        critic_rollout = critic_rollout.union(old_log_prob)
+
+        critic_rollout.meta_info["global_token_num"] = torch.sum(critic_rollout.batch["attention_mask"], dim=-1).tolist()
+        critic_rollout.meta_info["temperature"] = float(
+            OmegaConf.select(self.config, "generative_critic.train_temperature", default=1.0)
+        )
+
+        critic_output = self.critic_wg.update_generative_critic(critic_rollout)
+        critic_output = unpad_dataproto(critic_output, pad_size)
+        raw_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+
+        prefixed_metrics = {}
+        for key, value in raw_metrics.items():
+            if key.startswith("actor/"):
+                prefixed_metrics[f"gen_critic/{key[len('actor/'):]}"] = value
+            else:
+                prefixed_metrics[f"gen_critic/{key}"] = value
+
+        prefixed_metrics.update(rlvr_metrics)
+        prefixed_metrics["gen_critic/train/num_samples"] = float(valid_confusion_samples)
+        prefixed_metrics["gen_critic/train/confusion/num_skipped_non_strict"] = float(len(train_items) - valid_confusion_samples)
+        prefixed_metrics["gen_critic/train/success_rate"] = float(trajectory_success.float().mean().item())
+        prefixed_metrics["gen_critic/train/confusion/pred_true_target_true"] = float(pred_true_target_true)
+        prefixed_metrics["gen_critic/train/confusion/pred_true_target_false"] = float(pred_true_target_false)
+        prefixed_metrics["gen_critic/train/confusion/pred_false_target_true"] = float(pred_false_target_true)
+        prefixed_metrics["gen_critic/train/confusion/pred_false_target_false"] = float(pred_false_target_false)
+        if success_source == "trajectory_success_field":
+            prefixed_metrics["gen_critic/train/success_source"] = 2.0
+        elif success_source == "metrics":
+            prefixed_metrics["gen_critic/train/success_source"] = 1.0
+        else:
+            prefixed_metrics["gen_critic/train/success_source"] = 0.0
+        prefixed_metrics["gen_critic/train/success_source_field"] = 1.0 if success_source == "trajectory_success_field" else 0.0
+        prefixed_metrics["gen_critic/train/success_source_metrics"] = 1.0 if success_source == "metrics" else 0.0
+        prefixed_metrics["gen_critic/train/success_source_fallback"] = 1.0 if success_source == "score_fallback" else 0.0
+        if critic_entropy is not None:
+            prefixed_metrics["gen_critic/train/entropy"] = critic_entropy
+        return prefixed_metrics, critic_gen_time
+
+    def _compute_critic_confusion_eval_metrics(self, batch: DataProto) -> dict:
+        """Compute confusion-matrix-style counts for critic predictions in eval/validation.
+
+        rows: predict {true,false}; cols: target {true,false}
+        """
+        if "messages_list" not in batch.non_tensor_batch:
+            return {"gen_critic/eval/confusion/skipped_missing_messages": 1.0}
+
+        messages_list = batch.non_tensor_batch["messages_list"].tolist()
+        if "trajectory_success" in batch.non_tensor_batch:
+            trajectory_success = torch.tensor(batch.non_tensor_batch["trajectory_success"], dtype=torch.float32) > 0.5
+        else:
+            trajectory_success = self.generative_critic.trajectory_success_from_scores(
+                token_level_scores=batch.batch.get("token_level_scores", batch.batch.get("rm_scores")),
+                response_mask=batch.batch.get("response_mask", batch.batch.get("loss_mask")),
+            )
+
+        turn_ids = batch.batch["turn_ids"] if "turn_ids" in batch.batch else None
+        eval_items = self.generative_critic.build_train_judge_prompts(
+            messages_list=messages_list,
+            turn_ids=turn_ids,
+            trajectory_success=trajectory_success,
+        )
+        if len(eval_items) == 0:
+            return {"gen_critic/eval/confusion/num_samples": 0.0}
+
+        prompts = [item.prompt for item in eval_items]
+        targets = [item.target_label for item in eval_items]
+
+        if self.use_trainable_generative_critic and self.use_critic:
+            gen_inputs = self._build_generative_critic_prompt_batch(prompts)
+            worker_divisor = int(self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes)
+            gen_inputs, pad_size = pad_dataproto_to_divisor(gen_inputs, size_divisor=worker_divisor)
+            critic_rollout = self.critic_wg.generate_critic_sequences(gen_inputs)
+            critic_rollout = unpad_dataproto(critic_rollout, pad_size)
+            if critic_rollout.batch is not None and "responses" in critic_rollout.batch.keys():
+                outputs = self.generative_critic_train_tokenizer.batch_decode(
+                    critic_rollout.batch["responses"],
+                    skip_special_tokens=True,
+                )
+            elif "response_texts" in critic_rollout.non_tensor_batch:
+                outputs = critic_rollout.non_tensor_batch["response_texts"].tolist()
+            else:
+                return {"gen_critic/eval/confusion/skipped_no_outputs": 1.0}
+        else:
+            # frozen critic path
+            turn_ids_for_infer = turn_ids
+            if turn_ids_for_infer is None:
+                return {"gen_critic/eval/confusion/skipped_missing_turn_ids": 1.0}
+            _, _, outputs = self.generative_critic.infer_turn_labels(
+                messages_list=messages_list,
+                turn_ids=turn_ids_for_infer,
+            )
+
+        pred_true_target_true = 0
+        pred_true_target_false = 0
+        pred_false_target_true = 0
+        pred_false_target_false = 0
+        valid_confusion_samples = 0
+        for text, target in zip(outputs, targets, strict=True):
+            if not self.generative_critic.has_strict_label_format(text):
+                continue
+            pred = self.generative_critic.parse_label(text)
+            if pred is None:
+                continue
+            valid_confusion_samples += 1
+            if pred and target:
+                pred_true_target_true += 1
+            elif pred and (not target):
+                pred_true_target_false += 1
+            elif (not pred) and target:
+                pred_false_target_true += 1
+            else:
+                pred_false_target_false += 1
+
+        return {
+            "gen_critic/eval/confusion/num_samples": float(valid_confusion_samples),
+            "gen_critic/eval/confusion/num_skipped_non_strict": float(len(eval_items) - valid_confusion_samples),
+            "gen_critic/eval/confusion/pred_true_target_true": float(pred_true_target_true),
+            "gen_critic/eval/confusion/pred_true_target_false": float(pred_true_target_false),
+            "gen_critic/eval/confusion/pred_false_target_true": float(pred_false_target_true),
+            "gen_critic/eval/confusion/pred_false_target_false": float(pred_false_target_false),
+        }
+
+    def _build_trainable_generative_critic_worker_config(self):
+        """Build critic worker config by reusing actor config with train overrides."""
+        critic_cfg = OmegaConf.create(OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True))
+
+        train_model_path = OmegaConf.select(self.config, "generative_critic.train_model_path", default=None)
+        if train_model_path is not None:
+            critic_cfg.model.path = train_model_path
+
+        train_micro_bsz = int(OmegaConf.select(self.config, "generative_critic.train_ppo_micro_batch_size_per_gpu", default=self.config.micro_batch_size_per_gpu))
+        train_mini_bsz = int(OmegaConf.select(self.config, "generative_critic.train_ppo_mini_batch_size", default=self.config.ppo_mini_batch_size))
+        train_epochs = int(OmegaConf.select(self.config, "generative_critic.train_ppo_epochs", default=self.config.actor_rollout_ref.actor.ppo_epochs))
+        train_lr = float(OmegaConf.select(self.config, "generative_critic.train_lr", default=self.config.actor_rollout_ref.actor.optim.lr))
+        train_temp = float(OmegaConf.select(self.config, "generative_critic.train_temperature", default=1.0))
+        train_max_new_tokens = int(OmegaConf.select(self.config, "generative_critic.train_max_new_tokens", default=256))
+
+        critic_cfg.actor.ppo_micro_batch_size_per_gpu = train_micro_bsz
+        critic_cfg.actor.ppo_mini_batch_size = train_mini_bsz
+        critic_cfg.actor.ppo_epochs = train_epochs
+        critic_cfg.actor.optim.lr = train_lr
+        # Generative critic RLVR currently does not provide ref_log_prob; disable KL-loss path
+        # to avoid requiring a reference-policy tensor in critic update batches.
+        critic_cfg.actor.use_kl_loss = False
+        critic_cfg.actor.kl_loss_coef = 0.0
+        critic_cfg.actor.use_ref = False
+        # Keep critic update independent from rollout-logprob/TIS requirements.
+        critic_cfg.actor.tis_imp_ratio_cap = -1
+        critic_cfg.rollout.calculate_log_probs = False
+        critic_cfg.rollout.temperature = train_temp
+        # IMPORTANT: vLLM rollout pads each shard to at least config.response_length.
+        # If sampling max_tokens is larger than response_length, different shards may end up
+        # with different local response widths and fail at DataProto.concat.
+        critic_cfg.rollout.response_length = train_max_new_tokens
+        critic_cfg.rollout.log_prob_micro_batch_size_per_gpu = train_micro_bsz
+        # Avoid OOM when actor and critic each create their own vLLM rollout engine.
+        critic_cfg.rollout.gpu_memory_utilization = float(
+            OmegaConf.select(
+                self.config,
+                "generative_critic.train_rollout_gpu_memory_utilization",
+                default=critic_cfg.rollout.gpu_memory_utilization,
+            )
+        )
+        critic_cfg.rollout.max_model_len = int(
+            OmegaConf.select(
+                self.config,
+                "generative_critic.train_rollout_max_model_len",
+                default=critic_cfg.rollout.max_model_len,
+            )
+        )
+        # Sleep mode conflicts with multiple vLLM engines in one process.
+        critic_cfg.rollout.free_cache_engine = False
+        return critic_cfg
 
         
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
@@ -267,6 +816,14 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             actor_rollout_wg=self.actor_rollout_wg,
             tokenizer=self.tokenizer
         )
+        if self.generative_critic.enabled and self.generative_critic.backend in {
+            "actor_rollout_vllm",
+            "vllm_actor_rollout",
+            "actor_vllm",
+            "vllm",
+        }:
+            self.generative_critic.set_generate_fn(self._generate_with_actor_rollout_vllm)
+            print("[GEN_CRITIC INIT] backend=actor_rollout_vllm (reuse actor rollout engine)")
 
     def _maybe_log_generations(self, inputs, outputs, scores, _type="val"):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -373,7 +930,17 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
+            test_batch.batch["token_level_scores"] = reward_tensor
+            if "loss_mask" in test_batch.batch:
+                test_batch.batch["response_mask"] = test_batch.batch["loss_mask"]
             scores = reward_tensor.sum(-1).cpu().tolist()
+
+            if self.generative_critic.enabled:
+                critic_eval_metrics = self._compute_critic_confusion_eval_metrics(test_batch)
+                for k, v in critic_eval_metrics.items():
+                    if k not in env_metric_dict:
+                        env_metric_dict[k] = []
+                    env_metric_dict[k].append(v)
 
             # Group scores by episode if turn-level mode
             if is_turn_level_mode and "messages_list" in test_batch.non_tensor_batch:
@@ -437,7 +1004,95 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         return metric_dict
 
     def init_workers(self):
-        super().init_workers()
+        if self.use_trainable_generative_critic:
+            self.resource_pool_manager.create_resource_pool()
+            self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+            if self.hybrid_engine:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                actor_rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRollout],
+                    config=self.config.actor_rollout_ref,
+                    role="actor_rollout",
+                )
+                self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            else:
+                raise NotImplementedError
+
+            if self.use_critic:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+                critic_cfg = self._build_trainable_generative_critic_worker_config()
+                critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+                self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+
+            if self.use_reference_policy:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+                ref_policy_cls = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RefPolicy],
+                    config=self.config.actor_rollout_ref,
+                    role="ref",
+                )
+                self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+
+            if self.use_rm:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+                rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+                self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+
+            all_wg = {}
+            wg_kwargs = {}
+            if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+                wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+            if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+                wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+                if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                    assert (
+                        OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                        is not None
+                    ), "worker_nsight_options must be set when using nsys with profile_steps"
+                    wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                        OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    )
+            wg_kwargs["device_name"] = self.device_name
+
+            for resource_pool, class_dict in self.resource_pool_to_cls.items():
+                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+                wg_dict = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=worker_dict_cls,
+                    **wg_kwargs,
+                )
+                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+                all_wg.update(spawn_wg)
+
+            if self.use_critic:
+                self.critic_wg = all_wg["critic"]
+                self.critic_wg.init_model()
+
+            if self.use_reference_policy and not self.ref_in_actor:
+                self.ref_policy_wg = all_wg["ref"]
+                self.ref_policy_wg.init_model()
+
+            self.rm_wg = None
+            if self.use_rm:
+                self.rm_wg = all_wg["rm"]
+                self.rm_wg.init_model()
+
+            self.actor_rollout_wg = all_wg["actor_rollout"]
+            self.actor_rollout_wg.init_model()
+
+            self.async_rollout_mode = False
+            if self.config.actor_rollout_ref.rollout.mode == "async":
+                from verl.experimental.agent_loop import AgentLoopManager
+
+                self.async_rollout_mode = True
+                self.async_rollout_manager = AgentLoopManager(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wg,
+                    rm_wg=self.rm_wg,
+                )
+        else:
+            super().init_workers()
 
         # create rollout filter
         rollout_cfg = self.config.actor_rollout_ref.rollout
@@ -571,6 +1226,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         for step in range(self.total_training_steps):
             # metrics = {}
             timing_raw = {}
+            critic_generation_time = 0.0
 
             batch: DataProto = DataProto()
             is_last_step = self.global_steps >= self.total_training_steps
@@ -579,6 +1235,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # generate a batch
                 with marked_timer("gen", timing_raw):
                     batch = self.agent_proxy.rollout(batch, val=False)
+                    critic_train_batch = deepcopy(batch) if self.use_trainable_generative_critic else None
 
                     # Filter first, then adjust batch size
                     batch, metrics = self.rollout_filter.filter(batch)
@@ -688,7 +1345,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         metrics.update({"rollout/ref_log_prob": avg_ref_log_prob})
 
                 # compute values
-                if self.use_critic:
+                if self.use_critic and (not self.use_trainable_generative_critic):
                     with marked_timer("values", timing_raw):
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
@@ -711,21 +1368,63 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # compute advantages, executed on the driver process
+                    use_label_outcome_advantage = self.config.algorithm.get("use_label_outcome_advantage", False)
+                    if use_label_outcome_advantage:
+                        print("[GEN_CRITIC FLOW] use_label_outcome_advantage=True, entering label inference path")
+                        label_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+                        label_metrics = {"gen_critic/enabled": 0.0}
 
-                    norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                        if self.generative_critic.enabled and "messages_list" in batch.non_tensor_batch and "turn_ids" in batch.batch:
+                            messages_list = batch.non_tensor_batch["messages_list"].tolist()
+                            if self.use_trainable_generative_critic and self.use_critic:
+                                label_tensor, label_metrics, critic_label_gen_time = self._infer_labels_with_trainable_critic(
+                                    messages_list=messages_list,
+                                    turn_ids=batch.batch["turn_ids"],
+                                )
+                                critic_generation_time += critic_label_gen_time
+                            else:
+                                label_tensor, label_metrics, _ = self.generative_critic.infer_turn_labels(
+                                    messages_list=messages_list,
+                                    turn_ids=batch.batch["turn_ids"],
+                                )
+                            label_tensor = label_tensor.to(batch.batch["response_mask"].device)
 
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                        num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                        multi_turn=True,
-                        high_level_gamma=self.config.algorithm.high_level_gamma,
-                        bi_level_gae=self.config.algorithm.bi_level_gae,
-                    )
+                        outcome_tensor = self._compute_outcome_tensor(
+                            token_level_scores=batch.batch["token_level_scores"],
+                            response_mask=batch.batch["response_mask"],
+                        )
+
+                        label_weight = float(self.config.algorithm.get("label_weight", 1.0))
+                        outcome_weight = float(self.config.algorithm.get("outcome_weight", 1.0))
+                        combined_reward = label_weight * label_tensor + outcome_weight * outcome_tensor
+
+                        batch.batch["token_level_rewards"] = combined_reward
+                        batch.batch["advantages"] = combined_reward
+                        batch.batch["returns"] = combined_reward
+
+                        metrics.update(label_metrics)
+                        metrics.update({
+                            "train/label_reward_mean": (label_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
+                            "train/outcome_reward_mean": (outcome_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
+                            "train/combined_reward_mean": (combined_reward * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
+                        })
+
+                    else:
+                        # compute advantages, executed on the driver process
+
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            multi_turn=True,
+                            high_level_gamma=self.config.algorithm.high_level_gamma,
+                            bi_level_gae=self.config.algorithm.bi_level_gae,
+                        )
 
                 ##### A very different setting, just here for testing: Can I normalize the advantages to have a mean of 0?
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO and self.config.grpo_advantage_length_weight:
@@ -738,8 +1437,13 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # update critic
                 if self.use_critic:
                     with marked_timer("update_critic", timing_raw, color="pink"):
-                        critic_output = self.critic_wg.update_critic(batch)
-                    critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        if self.use_trainable_generative_critic:
+                            critic_source_batch = critic_train_batch if critic_train_batch is not None else batch
+                            critic_output_metrics, critic_train_gen_time = self._train_generative_critic_rlvr(critic_source_batch)
+                            critic_generation_time += critic_train_gen_time
+                        else:
+                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                     metrics.update(critic_output_metrics)
 
                 # implement critic warmup
@@ -780,8 +1484,13 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         self._save_checkpoint()
 
             # collect metrics
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            use_value_critic_metrics = self.use_critic and (not self.use_trainable_generative_critic)
+            metrics.update(compute_data_metrics(batch=batch, use_critic=use_value_critic_metrics))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            if self.use_trainable_generative_critic:
+                metrics["timing_s/critic_generation"] = critic_generation_time
+                actor_generation_time = timing_raw.get("gen", 0.0)
+                metrics["timing_s/actor_generation"] = actor_generation_time
             # TODO: implement actual tflpo and theoretical tflpo
             n_gpus = self.resource_pool_manager.get_n_gpus()
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

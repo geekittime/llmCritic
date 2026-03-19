@@ -75,6 +75,76 @@ def compute_grpo_outcome_advantage(
 
     return scores, scores
 
+
+def compute_turn_gae_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_ids: torch.Tensor,
+    turn_value_mask: torch.Tensor,
+    turn_value_ids: torch.Tensor,
+    gamma: float,
+    lam: float,
+):
+    """Compute turn-level GAE and broadcast to action tokens in each turn."""
+    with torch.no_grad():
+        token_level_rewards = token_level_rewards.float()
+        values = values.float()
+        response_mask = response_mask.float()
+        turn_value_mask = turn_value_mask > 0
+
+        boundary_values = values * turn_value_mask.float()
+
+        advantages = torch.zeros_like(values)
+        returns = torch.zeros_like(values)
+
+        batch_size = values.shape[0]
+        for b in range(batch_size):
+            boundary_positions = torch.nonzero(turn_value_mask[b], as_tuple=True)[0]
+            if boundary_positions.numel() == 0:
+                continue
+
+            turn_adv = torch.zeros(boundary_positions.numel(), dtype=values.dtype, device=values.device)
+            turn_ret = torch.zeros_like(turn_adv)
+            turn_rewards = torch.zeros_like(turn_adv)
+
+            for i, pos in enumerate(boundary_positions):
+                tid = turn_value_ids[b, pos]
+                if tid < 0:
+                    continue
+                action_token_mask = (turn_ids[b] == tid) & (response_mask[b] > 0)
+                turn_rewards[i] = token_level_rewards[b][action_token_mask].sum()
+
+            lastgaelam = torch.tensor(0.0, dtype=values.dtype, device=values.device)
+            for i in range(boundary_positions.numel() - 1, -1, -1):
+                pos = boundary_positions[i]
+                reward = turn_rewards[i]
+                value = boundary_values[b, pos]
+
+                if i < boundary_positions.numel() - 1:
+                    next_pos = boundary_positions[i + 1]
+                    next_value = boundary_values[b, next_pos]
+                else:
+                    next_value = torch.tensor(0.0, dtype=values.dtype, device=values.device)
+
+                delta = reward + gamma * next_value - value
+                lastgaelam = delta + gamma * lam * lastgaelam
+                turn_adv[i] = lastgaelam
+                turn_ret[i] = lastgaelam + value
+
+            for i, pos in enumerate(boundary_positions):
+                tid = turn_value_ids[b, pos]
+                if tid < 0:
+                    continue
+                token_mask = (turn_ids[b] == tid) & (response_mask[b] > 0)
+                advantages[b, token_mask] = turn_adv[i]
+                returns[b, token_mask] = turn_ret[i]
+                returns[b, pos] = turn_ret[i]
+
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+
+    return advantages, returns
+
 # supported by Kangrui Wang
 def compute_bi_level_gae_advantage_return(
         token_level_rewards: torch.Tensor,

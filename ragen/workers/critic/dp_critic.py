@@ -174,10 +174,8 @@ class DataParallelPPOCritic(BasePPOCritic):
 
 
         values = torch.concat(values_lst, dim=0)
-        responses = data.batch["responses"]
-        # attention_mask = data.batch["attention_mask"]
-        response_length = responses.size(1)
-        values = values * data.batch["response_mask"] #attention_mask[:, -response_length - 1:-1]
+        if "turn_value_mask" not in data.batch:
+            values = values * data.batch["response_mask"]
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
@@ -194,6 +192,8 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = {}
 
         select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns", "response_mask"]
+        if "turn_value_mask" in data.batch:
+            select_keys.append("turn_value_mask")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -235,6 +235,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     response_length = responses.size(1)
 
                     response_mask = data["response_mask"]
+                    value_mask = data.get("turn_value_mask", response_mask)
                     # eos_mask = attention_mask[:, -response_length - 1:-1]
 
                     vpreds = self._forward_micro_batch(data)
@@ -245,7 +246,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                         vpreds=vpreds,
                         values=values,
                         returns=returns,
-                        response_mask=response_mask,
+                        response_mask=value_mask,
                         cliprange_value=self.config.cliprange_value,
                     )
                     if self.config.use_dynamic_bsz:
@@ -259,7 +260,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     data = {
                         "critic/vf_loss": vf_loss.detach().item(),
                         "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                        "critic/vpred_mean": masked_mean(vpreds, value_mask).detach().item(),
                     }
 
                     append_to_dict(metrics, data)

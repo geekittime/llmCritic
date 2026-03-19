@@ -48,20 +48,21 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     max_model_len: 3600
     prompt_length: 1 # useless. Just put it here
-    response_length: 400 # single-turn response length
+    response_length: 50 # single-turn response length
     gpu_memory_utilization: 0.5
     max_num_batched_tokens: 8192 # set only when enable_chunked_prefill is true
     temperature: 1
     rollout_filter_ratio: 0.25
     rollout_filter_type: largest # smallest or largest
     rollout_filter_metric: reward_variance
-    enforce_eager: True #  for small models, set both enforce_eager and free_cache_engine to False to make rollout faster
-    free_cache_engine: True
+    enforce_eager: False #  for small models, set both enforce_eager and free_cache_engine to False to make rollout faster
+    free_cache_engine: False
     val_kwargs:
       do_sample: True
       temperature: 0.5
 
 critic:
+  enable: False
   ppo_mini_batch_size: ${ppo_mini_batch_size} # by default, ppo_mini_batch_size = train_batch_size / 4
   ppo_micro_batch_size_per_gpu: ${micro_batch_size_per_gpu} # following micro_batch_size_per_gpu
   model:
@@ -84,10 +85,48 @@ algorithm:
   high_level_gamma: 0.95
   adv_estimator: gae
   bi_level_gae: False
+  use_label_outcome_advantage: True
+  label_weight: 1.0
+  outcome_weight: 1.0
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
     kl_coef: 0.000
+
+generative_critic:
+  enable: False
+  backend: transformers # transformers | actor_rollout_vllm
+  use_chat_template: True
+  model_path: ${model_path}
+  train_enable: False
+  train_strategy: actor_ppo
+  train_model_path: ${model_path}
+  train_temperature: 1.0
+  train_max_new_tokens: 256
+  train_rollout_gpu_memory_utilization: 0.35
+  train_rollout_max_model_len: 2048
+  train_ppo_mini_batch_size: ${ppo_mini_batch_size}
+  train_ppo_micro_batch_size_per_gpu: ${micro_batch_size_per_gpu}
+  train_ppo_epochs: 1
+  train_lr: 1e-6
+  train_top_p: 1.0
+  train_top_k: -1
+  rlvr_format_reward: 0.2
+  rlvr_label_reward: 1.0
+  rlvr_label_penalty: -1.0
+  rlvr_parse_fail_penalty: -1.0
+  trust_remote_code: True
+  do_sample: False
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  max_new_tokens: 128
+  inference_batch_size: 8
+  default_label_if_parse_fail: False
+  debug_print_samples: False
+  debug_max_print: 2
+  debug_max_prompt_chars: 1200
+  debug_max_output_chars: 600
 
 trainer:
   project_name: ragen_latest
@@ -113,6 +152,7 @@ agent_proxy:
   action_sep: "||"
   max_actions_per_turn: 2 # how many actions can be output at most in a single turn
   use_turn_scores: False # important to GAE when applying token-level rewards to token-level advantages. If False, will take the sum of scores as the reward for the last turn.
+  debug_turn_boundary: False
   enable_think: True # False -> no think RL
   reward_normalization:
     grouping: "state" # state / batch / inductive

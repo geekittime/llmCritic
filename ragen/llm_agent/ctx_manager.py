@@ -295,6 +295,9 @@ class ContextManager:
         episode_rewards_tensor = torch.tensor(episode_raw_rewards, dtype=torch.float32)
         episode_penalties_tensor = torch.tensor(episode_penalties, dtype=torch.float32)
         normalized = episode_rewards_tensor + episode_penalties_tensor
+        # If any format penalty occurred in the episode, override the reward to -10
+        has_penalty_mask = episode_penalties_tensor != 0
+        normalized = torch.where(has_penalty_mask, torch.full_like(normalized, -1.0), normalized)
 
         group2index = {}
         for i, tag in enumerate(group_tags):
@@ -336,6 +339,7 @@ class ContextManager:
         messages_list: List[List[Dict]],
         episode_ids: Optional[List[int]] = None,
         uid_list: Optional[List[Any]] = None,
+        trajectory_success: Optional[List[float]] = None,
     ) -> DataProto:
         """Build DataProto with common structure for all modes."""
         llm_inputs = DataProto()
@@ -358,6 +362,8 @@ class ContextManager:
             non_tensor["episode_ids"] = np.array(episode_ids, dtype=int)
         if uid_list is not None:
             non_tensor["uid"] = np.array(uid_list, dtype=object)
+        if trajectory_success is not None:
+            non_tensor["trajectory_success"] = np.array(trajectory_success, dtype=np.float32)
 
         llm_inputs.non_tensor_batch = non_tensor
         return llm_inputs
@@ -742,6 +748,7 @@ class ContextManager:
         group_ids = []
         episode_ids = []
         episode_rewards = []
+        episode_success = []
         uid_list = []
 
         max_context_window = self._resolve_max_context_window()
@@ -803,6 +810,7 @@ class ContextManager:
                 group_ids.append(env_output["group_id"])
                 episode_ids.append(episode_idx)
                 episode_rewards.append(normalized_reward)
+                episode_success.append(float(env_output.get("metrics", {}).get(f"{env_output['tag']}/success", 0.0)))
                 uid_list.append(env_output.get("uid", env_output["env_id"]))
 
         # Tokenize
@@ -823,7 +831,7 @@ class ContextManager:
         # Build DataProto
         llm_inputs = self._build_dataproto(
             input_ids, attention_mask, position_ids, loss_mask, score_tensor,
-            env_ids, group_ids, messages_list, episode_ids, uid_list
+            env_ids, group_ids, messages_list, episode_ids, uid_list, episode_success
         )
 
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
@@ -843,6 +851,7 @@ class ContextManager:
         group_ids = []
         episode_ids = []
         episode_rewards = []
+        episode_success = []
         uid_list = []
 
         max_context_window = self._resolve_max_context_window()
@@ -904,6 +913,7 @@ class ContextManager:
                 group_ids.append(env_output["group_id"])
                 episode_ids.append(episode_idx)
                 episode_rewards.append(normalized_reward)
+                episode_success.append(float(env_output.get("metrics", {}).get(f"{env_output['tag']}/success", 0.0)))
                 uid_list.append(env_output.get("uid", env_output["env_id"]))
 
         # Tokenize
@@ -924,7 +934,7 @@ class ContextManager:
         # Build DataProto
         llm_inputs = self._build_dataproto(
             input_ids, attention_mask, position_ids, loss_mask, score_tensor,
-            env_ids, group_ids, messages_list, episode_ids, uid_list
+            env_ids, group_ids, messages_list, episode_ids, uid_list, episode_success
         )
 
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
@@ -968,11 +978,89 @@ class ContextManager:
 
         # Build scores using existing logic
         scores = [[i.get('reward', 0.0) for i in self._extract_history(env_output, True)] for env_output in env_outputs]
+        # If any format penalty occurred in the episode, override the total score to -10
+        scores = [
+            [-1] if env_output.get("penalty", 0) != 0 else turn_scores
+            for env_output, turn_scores in zip(env_outputs, scores)
+        ]
         score_tensor, loss_mask, response_mask = get_masks_and_scores(
             input_ids, self.tokenizer, scores,
             use_turn_scores=self.config.agent_proxy.use_turn_scores,
             enable_response_mask=self.config.enable_response_mask
         )
+
+        # Build turn-level indexing tensors for turn-PPO style training.
+        # turn_ids: assistant action tokens -> turn index, else -1
+        # turn_value_mask: only one boundary token per turn (query/env end token)
+        # turn_value_ids: turn index at boundary tokens, else -1
+        special_token, _ = get_special_tokens(self.tokenizer)
+        turn_starts = torch.where(input_ids == special_token, 1, 0)
+        turn_indicators = torch.cumsum(turn_starts, dim=-1)
+        assistant_mask = (turn_indicators % 2 == 1) & (turn_indicators > 1)
+
+        turn_ids = torch.full_like(loss_mask, -1, dtype=torch.long)
+        assistant_turn_ids = ((turn_indicators - 3) // 2).to(torch.long)
+        turn_ids = torch.where(assistant_mask[:, :-1], assistant_turn_ids[:, :-1], turn_ids)
+
+        turn_value_mask = torch.zeros_like(loss_mask, dtype=torch.float32)
+        turn_value_ids = torch.full_like(loss_mask, -1, dtype=torch.long)
+        for b in range(input_ids.shape[0]):
+            assistant_positions = torch.nonzero(assistant_mask[b], as_tuple=True)[0]
+            if assistant_positions.numel() == 0:
+                continue
+
+            # assistant turn starts are the first token of each assistant segment
+            starts = [assistant_positions[0].item()]
+            prev_pos = assistant_positions[0].item()
+            for pos in assistant_positions[1:]:
+                pos = pos.item()
+                if pos != prev_pos + 1:
+                    starts.append(pos)
+                prev_pos = pos
+
+            for end_pos in starts:
+                boundary_pos = end_pos - 1
+                if boundary_pos < 0 or boundary_pos >= turn_value_mask.shape[1]:
+                    continue
+                turn_value_mask[b, boundary_pos] = 1.0
+                turn_value_ids[b, boundary_pos] = assistant_turn_ids[b, end_pos]
+
+        if getattr(self.config.agent_proxy, "debug_turn_boundary", False):
+            max_samples = min(input_ids.shape[0], 2)
+            print("\n[TURN-BOUNDARY DEBUG]")
+            for b in range(max_samples):
+                ids = input_ids[b].tolist()
+                boundary_positions = torch.nonzero(turn_value_mask[b] > 0, as_tuple=True)[0].tolist()
+                assistant_positions = torch.nonzero(assistant_mask[b], as_tuple=True)[0].tolist()
+                assistant_starts = []
+                prev_pos = None
+                for pos in assistant_positions:
+                    if prev_pos is None or pos != prev_pos + 1:
+                        assistant_starts.append(pos)
+                    prev_pos = pos
+
+                print(f"sample={b} assistant_starts={assistant_starts}")
+                print(f"sample={b} boundary_positions={boundary_positions}")
+
+                for idx, (boundary_pos, assistant_start) in enumerate(zip(boundary_positions, assistant_starts)):
+                    left = ids[boundary_pos - 1] if boundary_pos - 1 >= 0 else "<BOS>"
+                    boundary = ids[boundary_pos]
+                    right = ids[boundary_pos + 1] if boundary_pos + 1 < len(ids) else "<EOS>"
+
+                    left_str = self.tokenizer.decode([left], skip_special_tokens=False) if isinstance(left, int) else left
+                    boundary_str = self.tokenizer.decode([boundary], skip_special_tokens=False)
+                    right_str = self.tokenizer.decode([right], skip_special_tokens=False) if isinstance(right, int) else right
+
+                    print(
+                        f"sample={b} turn={idx} "
+                        f"boundary_pos={boundary_pos} assistant_start={assistant_start} "
+                        f"ctx=[{left_str}] [BOUNDARY:{boundary_str}] [ASSIST_START:{right_str}]"
+                    )
+
+                if b < len(messages_list):
+                    print(f"sample={b} full_messages=")
+                    for i, msg in enumerate(messages_list[b]):
+                        print(f"  {i:02d} {msg['role']}:\n{msg['content']}")
 
         # Normalize scores
         if not self.config.agent_proxy.use_turn_scores:
@@ -990,12 +1078,19 @@ class ContextManager:
             "loss_mask": loss_mask,
             "rm_scores": score_tensor,
             "original_rm_scores": score_tensor.clone(),
+            "turn_ids": turn_ids,
+            "turn_value_mask": turn_value_mask,
+            "turn_value_ids": turn_value_ids,
         }, batch_size=input_ids.shape[0])
 
         llm_inputs.non_tensor_batch = {
             "env_ids": np.array([env_output["env_id"] for env_output in env_outputs], dtype=int),
             "group_ids": np.array([env_output["group_id"] for env_output in env_outputs], dtype=int),
             "messages_list": np.array(messages_list, dtype=object),
+            "trajectory_success": np.array([
+                float(env_output.get("metrics", {}).get(f"{env_output.get('tag', '')}/success", 0.0))
+                for env_output in env_outputs
+            ], dtype=np.float32),
         }
 
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}

@@ -209,7 +209,7 @@ class TaskRunner:
         # define worker classes
         if config.actor_rollout_ref.actor.strategy == 'fsdp':
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+            from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, GenerativeCriticWorker
             from verl.single_controller.ray import RayWorkerGroup
             ray_worker_group_cls = RayWorkerGroup
 
@@ -218,9 +218,14 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+        use_trainable_generative_critic = bool(
+            config.get("generative_critic", {}).get("train_enable", False)
+        )
+        critic_worker_cls = GenerativeCriticWorker if use_trainable_generative_critic else CriticWorker
+
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-            Role.Critic: ray.remote(CriticWorker),
+            Role.Critic: ray.remote(critic_worker_cls),
         }
         if config.actor_rollout_ref.actor.use_ref:
             print("[DEBUG] using ref policy")

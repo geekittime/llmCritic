@@ -75,6 +75,7 @@ class ActorRolloutRefWorker(VerlActorRolloutRefWorker):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
+        sampling_kwargs = prompts.meta_info.get("sampling_kwargs", None)
         mode = prompts.meta_info.get("mode", "singleturn")
         skip_generation = prompts.meta_info.get("skip_generation", False)
 
@@ -112,7 +113,10 @@ class ActorRolloutRefWorker(VerlActorRolloutRefWorker):
                 log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
             with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(prompts=prompts)
+                if sampling_kwargs is not None:
+                    output = self.rollout.generate_sequences(prompts=prompts, **sampling_kwargs)
+                else:
+                    output = self.rollout.generate_sequences(prompts=prompts)
 
             if self._is_actor and mode in {"singleturn", "multiturn-end"}:
                 try:
@@ -375,3 +379,30 @@ class CriticWorker(VerlCriticWorker):
             raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
 
         return critic_module, critic_optimizer, critic_lr_scheduler
+
+
+class GenerativeCriticWorker(ActorRolloutRefWorker):
+    """Independent trainable generative critic worker.
+
+    This worker reuses actor PPO update structure (policy gradient on generated
+    text) while remaining an independent Role.Critic worker.
+    """
+
+    def __init__(self, config, **kwargs):
+        # Train critic with actor-like policy update/generation interfaces.
+        super().__init__(config=config, role="actor_rollout", **kwargs)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="gen_critic_compute_log_prob")
+    def compute_critic_log_prob(self, data: DataProto):
+        return self.compute_log_prob(data)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="gen_critic_update")
+    def update_generative_critic(self, data: DataProto):
+        return self.update_actor(data)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="gen_critic_generate")
+    def generate_critic_sequences(self, prompts: DataProto):
+        return self.generate_sequences(prompts)

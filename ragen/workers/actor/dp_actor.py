@@ -44,6 +44,62 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def compute_turn_policy_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_ids: torch.Tensor,
+    cliprange: float,
+    cliprange_low: float,
+    cliprange_high: float,
+    clip_ratio_c: float,
+):
+    turn_old_log_prob = []
+    turn_log_prob = []
+    turn_advantages = []
+
+    for b in range(turn_ids.size(0)):
+        valid_turn_ids = torch.unique(turn_ids[b][turn_ids[b] >= 0], sorted=True)
+        for tid in valid_turn_ids:
+            token_mask = (turn_ids[b] == tid) & (response_mask[b] > 0)
+            if not torch.any(token_mask):
+                continue
+
+            token_indices = torch.nonzero(token_mask, as_tuple=True)[0]
+            turn_advantage = advantages[b, token_indices[0]]
+            turn_old_log_prob.append(old_log_prob[b][token_mask].sum())
+            turn_log_prob.append(log_prob[b][token_mask].sum())
+            turn_advantages.append(turn_advantage)
+
+    if len(turn_log_prob) == 0:
+        zero = torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype)
+        return zero, zero, zero, zero
+
+    turn_old_log_prob = torch.stack(turn_old_log_prob)
+    turn_log_prob = torch.stack(turn_log_prob)
+    turn_advantages = torch.stack(turn_advantages)
+
+    # Reuse the existing PPO implementation with turn-level packed tensors.
+    # Shape as (num_turns, 1), with mask=1 to keep code path aligned.
+    turn_old_log_prob = turn_old_log_prob.unsqueeze(-1)
+    turn_log_prob = turn_log_prob.unsqueeze(-1)
+    turn_advantages = turn_advantages.unsqueeze(-1)
+    turn_mask = torch.ones_like(turn_advantages)
+
+    return compute_policy_loss(
+        old_log_prob=turn_old_log_prob,
+        log_prob=turn_log_prob,
+        advantages=turn_advantages,
+        response_mask=turn_mask,
+        cliprange=cliprange,
+        cliprange_low=cliprange_low,
+        cliprange_high=cliprange_high,
+        clip_ratio_c=clip_ratio_c,
+        loss_agg_mode="token-mean",
+    )
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -262,6 +318,8 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "response_mask"]
+        if "turn_ids" in data.batch:
+            select_keys.append("turn_ids")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
@@ -308,6 +366,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # response_mask = attention_mask[:, -response_length:]
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
+                    turn_ids = data.get("turn_ids", None)
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -322,17 +381,30 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
+                    if turn_ids is not None:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_turn_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            turn_ids=turn_ids,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
