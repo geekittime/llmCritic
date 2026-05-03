@@ -86,6 +86,8 @@ algorithm:
   adv_estimator: gae
   bi_level_gae: False
   use_label_outcome_advantage: True
+  critic_score_weight: 1.0
+  trajectory_reward_weight: 1.0
   label_weight: 1.0
   outcome_weight: 1.0
   kl_penalty: kl  # how to estimate kl divergence
@@ -95,9 +97,17 @@ algorithm:
 
 generative_critic:
   enable: False
+  eval_enable: null
   backend: transformers # transformers | actor_rollout_vllm
+  response_format: structured
   use_chat_template: True
   model_path: ${model_path}
+  deepseek_model: deepseek-chat
+  deepseek_api_key: null
+  deepseek_api_base: https://api.deepseek.com
+  deepseek_timeout: 60.0
+  deepseek_max_retries: 3
+  deepseek_max_concurrency: 8
   train_enable: False
   train_strategy: actor_ppo
   train_model_path: ${model_path}
@@ -123,6 +133,8 @@ generative_critic:
   max_new_tokens: 128
   inference_batch_size: 8
   default_label_if_parse_fail: False
+  true_score: 1.0
+  false_score: 0.0
   debug_print_samples: False
   debug_max_print: 2
   debug_max_prompt_chars: 1200

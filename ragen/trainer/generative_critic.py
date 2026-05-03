@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -59,6 +60,10 @@ class FrozenGenerativeCritic:
         self.config = config
         self.enabled = bool(OmegaConf.select(config, "generative_critic.enable", default=False))
         self.backend = str(OmegaConf.select(config, "generative_critic.backend", default="transformers")).lower()
+        default_response_format = "bool_only" if self.backend in {"deepseek_api", "deepseek"} else "structured"
+        self.response_format = str(
+            OmegaConf.select(config, "generative_critic.response_format", default=default_response_format)
+        ).lower()
 
         self.model_path = OmegaConf.select(config, "generative_critic.model_path", default=None)
         if self.model_path is None:
@@ -74,6 +79,11 @@ class FrozenGenerativeCritic:
 
         self.default_label_if_parse_fail = bool(
             OmegaConf.select(config, "generative_critic.default_label_if_parse_fail", default=False)
+        )
+        default_false_score = -1.0 if self.backend in {"deepseek_api", "deepseek"} else 0.0
+        self.true_score = float(OmegaConf.select(config, "generative_critic.true_score", default=1.0))
+        self.false_score = float(
+            OmegaConf.select(config, "generative_critic.false_score", default=default_false_score)
         )
         self.rlvr_format_reward = float(OmegaConf.select(config, "generative_critic.rlvr_format_reward", default=0.2))
         self.rlvr_label_reward = float(OmegaConf.select(config, "generative_critic.rlvr_label_reward", default=1.0))
@@ -91,11 +101,45 @@ class FrozenGenerativeCritic:
         self.debug_max_output_chars = int(
             OmegaConf.select(config, "generative_critic.debug_max_output_chars", default=600)
         )
+        self.deepseek_model = str(
+            OmegaConf.select(config, "generative_critic.deepseek_model", default="deepseek-chat")
+        )
+        self.deepseek_api_key = OmegaConf.select(
+            config,
+            "generative_critic.deepseek_api_key",
+            default=os.environ.get("DEEPSEEK_API_KEY"),
+        )
+        self.deepseek_api_base = str(
+            OmegaConf.select(config, "generative_critic.deepseek_api_base", default="https://api.deepseek.com")
+        )
+        self.deepseek_timeout = float(
+            OmegaConf.select(config, "generative_critic.deepseek_timeout", default=60.0)
+        )
+        self.deepseek_max_retries = int(
+            OmegaConf.select(config, "generative_critic.deepseek_max_retries", default=3)
+        )
+        default_deepseek_max_concurrency = 64 if self.backend in {"deepseek_api", "deepseek"} else 8
+        self.deepseek_max_concurrency = int(
+            OmegaConf.select(
+                config,
+                "generative_critic.deepseek_max_concurrency",
+                default=default_deepseek_max_concurrency,
+            )
+        )
+        default_eval_enable = False if self.backend in {"deepseek_api", "deepseek"} else True
+        eval_enable_cfg = OmegaConf.select(config, "generative_critic.eval_enable", default=None)
+        self.eval_enable = default_eval_enable if eval_enable_cfg is None else bool(eval_enable_cfg)
 
         self._tokenizer: Optional[Any] = None
         self._model: Optional[AutoModelForCausalLM] = None
         self._generate_fn: Optional[Callable[[Sequence[str], Dict[str, Any]], List[str]]] = None
+        self._deepseek_client: Optional[Any] = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._last_generation_metadata: Dict[str, float] = {
+            "gen_critic/api_failure_count": 0.0,
+            "gen_critic/api_failure_rate": 0.0,
+            "gen_critic/api_batch_failed": 0.0,
+        }
 
     def set_generate_fn(self, generate_fn: Callable[[Sequence[str], Dict[str, Any]], List[str]]) -> None:
         """Inject generation backend callback (e.g., actor rollout vLLM)."""
@@ -235,6 +279,7 @@ class FrozenGenerativeCritic:
         has_after_state: bool,
         env_instruction: str,
         critic_instruction: Optional[str],
+        response_format: str,
     ) -> str:
         turn_text = "unknown"
         if turn_number is not None:
@@ -252,6 +297,18 @@ class FrozenGenerativeCritic:
                 "[Environment instruction]\n"
                 f"{env_instruction}\n"
                 "\n"
+            )
+
+        if critic_instruction:
+            judge_instruction = critic_instruction
+        elif response_format == "bool_only":
+            judge_instruction = "Output exactly one word: True or False."
+        else:
+            judge_instruction = (
+                "Output format (two lines):\n"
+                "1) First, give a brief rationale grounded in the transition above. "
+                "You should check whether the action is helpful/harmful/correct/incorrect.\n"
+                "2) A label based on the rationale above: '###label: True' or '###label: False'."
             )
 
         return (
@@ -274,7 +331,7 @@ class FrozenGenerativeCritic:
             f"{state_after_text}\n"
             "\n"
             "Judge whether action a_t moves the agent closer to task completion.\n"
-            f"{critic_instruction if critic_instruction else 'Output format (two lines):\\n1) First, give a brief rationale grounded in the transition above. You should check whether the action is helpful/harmful/correct/incorrect.\\n2) A label based on the rationale above: \'###label: True\' or \'###label: False\'.'}"
+            f"{judge_instruction}"
         )
 
     def build_judge_prompts(self, messages_list: Sequence[Sequence[Dict[str, str]]], turn_ids: torch.Tensor) -> List[JudgePromptItem]:
@@ -305,6 +362,7 @@ class FrozenGenerativeCritic:
                     has_after_state=transition["has_after_state"],
                     env_instruction=transition["env_instruction"],
                     critic_instruction=critic_instruction,
+                    response_format=self.response_format,
                 )
                 items.append(
                     JudgePromptItem(
@@ -417,6 +475,7 @@ class FrozenGenerativeCritic:
                         has_after_state=transition["has_after_state"],
                         env_instruction=transition["env_instruction"],
                         critic_instruction=critic_instruction,
+                        response_format=self.response_format,
                     )
                     items.append(
                         JudgeTrainItem(
@@ -447,6 +506,7 @@ class FrozenGenerativeCritic:
                 has_after_state=transition["has_after_state"],
                 env_instruction=transition["env_instruction"],
                 critic_instruction=critic_instruction,
+                response_format=self.response_format,
             )
             items.append(
                 JudgeTrainItem(
@@ -517,7 +577,113 @@ class FrozenGenerativeCritic:
 
         return scalar_rewards.unsqueeze(-1).to(response_mask.dtype) * response_mask
 
+    def _label_to_score(self, label: bool) -> float:
+        return self.true_score if label else self.false_score
+
+    def _reset_generation_metadata(self) -> None:
+        self._last_generation_metadata = {
+            "gen_critic/api_failure_count": 0.0,
+            "gen_critic/api_failure_rate": 0.0,
+            "gen_critic/api_batch_failed": 0.0,
+        }
+
+    def _get_deepseek_client(self) -> Any:
+        if self._deepseek_client is not None:
+            return self._deepseek_client
+        if not self.deepseek_api_key:
+            raise ValueError("generative_critic.deepseek_api_key is not set")
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "DeepSeek API backend requires the `openai` package in the selected Python environment"
+            ) from exc
+        self._deepseek_client = AsyncOpenAI(
+            api_key=self.deepseek_api_key,
+            base_url=self.deepseek_api_base,
+        )
+        return self._deepseek_client
+
+    def _build_deepseek_messages(self, prompt: str) -> List[Dict[str, str]]:
+        system_prompt = (
+            "You are a strict turn-level RL critic. "
+            "Decide whether the assistant action moves the trajectory closer to the final task goal. "
+            "Reply with exactly one word: True or False."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+    async def _generate_one_deepseek(self, prompt: str, semaphore: asyncio.Semaphore) -> str:
+        client = self._get_deepseek_client()
+        messages = self._build_deepseek_messages(prompt)
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.deepseek_max_retries + 1):
+            try:
+                async with semaphore:
+                    response = await client.chat.completions.create(
+                        model=self.deepseek_model,
+                        messages=messages,
+                        max_tokens=self.max_new_tokens,
+                        temperature=self.temperature if self.do_sample else 0.0,
+                        top_p=self.top_p if self.do_sample else 1.0,
+                        timeout=self.deepseek_timeout,
+                    )
+                content = response.choices[0].message.content
+                return "" if content is None else str(content).strip()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt < self.deepseek_max_retries:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 5))
+        raise RuntimeError(f"DeepSeek API request failed after {self.deepseek_max_retries} attempts: {last_error}")
+
+    def _generate_texts_with_deepseek(self, prompts: Sequence[str]) -> List[str]:
+        if len(prompts) == 0:
+            self._reset_generation_metadata()
+            return []
+
+        if self.debug_print_samples:
+            print(
+                "[GEN_CRITIC INFER] "
+                f"backend=deepseek_api num_prompts={len(prompts)} max_tokens={self.max_new_tokens} "
+                f"max_concurrency={self.deepseek_max_concurrency}"
+            )
+
+        async def run_batch() -> List[str]:
+            semaphore = asyncio.Semaphore(self.deepseek_max_concurrency)
+            tasks = [self._generate_one_deepseek(prompt, semaphore) for prompt in prompts]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            outputs: List[str] = []
+            failure_count = 0
+            for result in results:
+                if isinstance(result, Exception):
+                    failure_count += 1
+                    outputs.append("")
+                else:
+                    outputs.append(result)
+            self._last_generation_metadata = {
+                "gen_critic/api_failure_count": float(failure_count),
+                "gen_critic/api_failure_rate": float(failure_count) / max(len(prompts), 1),
+                "gen_critic/api_batch_failed": 1.0 if failure_count == len(prompts) else 0.0,
+            }
+            return outputs
+
+        try:
+            return asyncio.run(run_batch())
+        except Exception:  # noqa: BLE001
+            self._last_generation_metadata = {
+                "gen_critic/api_failure_count": float(len(prompts)),
+                "gen_critic/api_failure_rate": 1.0,
+                "gen_critic/api_batch_failed": 1.0,
+            }
+            return [""] * len(prompts)
+
     def _generate_texts(self, prompts: Sequence[str]) -> List[str]:
+        self._reset_generation_metadata()
+        if self.backend in {"deepseek_api", "deepseek"}:
+            return self._generate_texts_with_deepseek(prompts)
+
         if self.backend in {"actor_rollout_vllm", "vllm_actor_rollout", "actor_vllm", "vllm"}:
             if self._generate_fn is None:
                 raise ValueError("generative_critic backend requires generate_fn, but it is not set")
@@ -594,7 +760,7 @@ class FrozenGenerativeCritic:
         """Infer per-token label tensor from per-turn generative judgments.
 
         Returns:
-            label_tensor: float tensor shaped like turn_ids, values in {0,1}
+            label_tensor: float tensor shaped like turn_ids, values in {false_score,true_score}
             metrics: parser and label-rate metrics
             raw_outputs: generated critic outputs in prompt order
         """
@@ -622,8 +788,8 @@ class FrozenGenerativeCritic:
                 parse_fail += 1
                 parsed = self.default_label_if_parse_fail
 
-            value = 1.0 if parsed else 0.0
-            if value > 0.5:
+            value = self._label_to_score(parsed)
+            if parsed:
                 true_count += 1
 
             mask = turn_ids[item.sample_index] == item.turn_id
@@ -648,4 +814,5 @@ class FrozenGenerativeCritic:
             "gen_critic/parse_fail_rate": float(parse_fail) / max(num_prompts, 1.0),
             "gen_critic/true_rate": float(true_count) / max(num_prompts, 1.0),
         }
+        metrics.update(self._last_generation_metadata)
         return label_tensor, metrics, outputs

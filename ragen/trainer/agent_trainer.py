@@ -381,10 +381,27 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         raise RuntimeError("vLLM generative critic path cannot find responses in output")
 
     @staticmethod
-    def _compute_outcome_tensor(token_level_scores: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
-        """Broadcast per-trajectory outcome score to all response tokens."""
+    def _compute_outcome_tensor(
+        token_level_scores: torch.Tensor,
+        response_mask: torch.Tensor,
+        trajectory_success: Optional[np.ndarray] = None,
+    ) -> tuple[torch.Tensor, str]:
+        """Broadcast per-trajectory outcome score to all response tokens.
+
+        Prefer explicit trajectory-level success labels when available so the
+        actor advantage matches the final environment success signal. Fall back
+        to the existing summed reward path for compatibility with other tasks.
+        """
+        if trajectory_success is not None:
+            success_tensor = torch.as_tensor(
+                trajectory_success,
+                dtype=torch.float32,
+                device=response_mask.device,
+            ).view(-1, 1)
+            return success_tensor * response_mask, "trajectory_success"
+
         outcome = (token_level_scores * response_mask).sum(dim=-1, keepdim=True)
-        return outcome * response_mask
+        return outcome * response_mask, "token_level_scores"
 
     def _build_generative_critic_prompt_batch(self, prompts: list[str]) -> DataProto:
         critic_tokenizer = self.generative_critic_train_tokenizer
@@ -498,8 +515,8 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 parse_fail += 1
                 parsed = self.generative_critic.default_label_if_parse_fail
 
-            value = 1.0 if parsed else 0.0
-            if value > 0.5:
+            value = self.generative_critic._label_to_score(parsed)
+            if parsed:
                 true_count += 1
             mask = turn_ids[item.sample_index] == item.turn_id
             label_tensor[item.sample_index, mask] = value
@@ -859,6 +876,12 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         sample_scores = []
 
         env_metric_dict = {}
+
+        def _append_metric(store: dict, key: str, value: float) -> None:
+            if key not in store:
+                store[key] = []
+            store[key].append(value)
+
         for step in range(self.config.trainer.validation_steps):
             
             meta_info = {
@@ -878,9 +901,8 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             end_time = time.time()
             print(f"validation generation time: {end_time - start_time} seconds")
             for key, value in test_batch.meta_info["metrics"].items():
-                if "val-env/" + key not in env_metric_dict:
-                    env_metric_dict["val-env/" + key] = []
-                env_metric_dict["val-env/" + key].append(value)
+                _append_metric(env_metric_dict, "val-env/" + key, value)
+                _append_metric(env_metric_dict, "val_env/" + key, value)
 
             # Store original inputs and outputs
             batch_size = test_batch.batch["input_ids"].shape[0]
@@ -935,12 +957,12 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 test_batch.batch["response_mask"] = test_batch.batch["loss_mask"]
             scores = reward_tensor.sum(-1).cpu().tolist()
 
-            if self.generative_critic.enabled:
+            if self.generative_critic.enabled and self.generative_critic.eval_enable:
                 critic_eval_metrics = self._compute_critic_confusion_eval_metrics(test_batch)
                 for k, v in critic_eval_metrics.items():
-                    if k not in env_metric_dict:
-                        env_metric_dict[k] = []
-                    env_metric_dict[k].append(v)
+                    _append_metric(env_metric_dict, k, v)
+            elif self.generative_critic.enabled:
+                _append_metric(env_metric_dict, "gen_critic/eval/skipped_disabled", 1.0)
 
             # Group scores by episode if turn-level mode
             if is_turn_level_mode and "messages_list" in test_batch.non_tensor_batch:
@@ -1000,6 +1022,10 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+                    if metric_sec == "val-core":
+                        metric_dict[f"val_core/{data_source}/{var_name}/{metric_name}"] = metric_val
+                    elif metric_sec == "val-aux":
+                        metric_dict[f"val_aux/{data_source}/{var_name}/{metric_name}"] = metric_val
 
         return metric_dict
 
@@ -1389,14 +1415,28 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                 )
                             label_tensor = label_tensor.to(batch.batch["response_mask"].device)
 
-                        outcome_tensor = self._compute_outcome_tensor(
+                        outcome_tensor, outcome_source = self._compute_outcome_tensor(
                             token_level_scores=batch.batch["token_level_scores"],
                             response_mask=batch.batch["response_mask"],
+                            trajectory_success=batch.non_tensor_batch.get("trajectory_success"),
                         )
 
-                        label_weight = float(self.config.algorithm.get("label_weight", 1.0))
-                        outcome_weight = float(self.config.algorithm.get("outcome_weight", 1.0))
-                        combined_reward = label_weight * label_tensor + outcome_weight * outcome_tensor
+                        critic_score_weight = float(
+                            self.config.algorithm.get(
+                                "critic_score_weight",
+                                self.config.algorithm.get("label_weight", 1.0),
+                            )
+                        )
+                        trajectory_reward_weight = float(
+                            self.config.algorithm.get(
+                                "trajectory_reward_weight",
+                                self.config.algorithm.get("outcome_weight", 1.0),
+                            )
+                        )
+                        combined_reward = (
+                            critic_score_weight * label_tensor
+                            + trajectory_reward_weight * outcome_tensor
+                        )
 
                         batch.batch["token_level_rewards"] = combined_reward
                         batch.batch["advantages"] = combined_reward
@@ -1404,9 +1444,13 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                         metrics.update(label_metrics)
                         metrics.update({
-                            "train/label_reward_mean": (label_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
-                            "train/outcome_reward_mean": (outcome_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
+                            "train/critic_score_mean": (label_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
+                            "train/trajectory_reward_mean": (outcome_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
                             "train/combined_reward_mean": (combined_reward * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
+                            "train/critic_score_weight": critic_score_weight,
+                            "train/trajectory_reward_weight": trajectory_reward_weight,
+                            "train/trajectory_reward_source_is_success": 1.0 if outcome_source == "trajectory_success" else 0.0,
+                            "train/trajectory_reward_source_is_token_scores": 1.0 if outcome_source == "token_level_scores" else 0.0,
                         })
 
                     else:
