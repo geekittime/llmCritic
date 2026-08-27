@@ -188,3 +188,58 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 - 进度奖励应近似 signed advantage，而不是绝对“好/坏”标签：[Rewarding Progress](https://arxiv.org/html/2410.08146)。
 - 任意 shaping 只有采用 potential difference `gamma*Phi(s')-Phi(s)` 才保持原最优策略：[Ng et al., ICML 1999](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf)。
 - LLM judge 的位置、冗长和自增强偏差：[Judging LLM-as-a-Judge](https://arxiv.org/abs/2306.05685)。
+
+## 2026-08-28 实现后验证
+
+### 可回溯提交
+
+| 提交 | 内容 |
+|---|---|
+| `e116389` | 初始代码审计、历史运行记录和风险清单 |
+| `ac242d1` | DeepSeek signed turn-PPO 实现、精确 token trace、并行 critic、worker wiring、测试和启动脚本 |
+| `3088304` | Ray worker 运行时凭据转发（仅从环境变量读取）以及 legacy critic 默认配置兼容修正 |
+
+当前分支为 `feature/turn-ppo-deepseek-progress`。实现提交没有把 DeepSeek 或 W&B 凭据写入 YAML、shell 参数或日志；Ray 启动时只转发进程环境中已经存在的对应变量。
+
+### 已实现的训练路径
+
+1. 每个 assistant turn 保留 rollout 原始 `prompt_token_ids`/`response_token_ids`，训练时拒绝隐式重新分词（除非显式打开 legacy fallback）。因果 LM 的 response mask 与 logits 做了 `j -> j+1` 对齐。
+2. actor 将一个 turn 内所有 token 的 old/new log-prob 在 log 空间求和，再计算 `exp(sum(new)-sum(old))` 的 PPO ratio；loss 以 turn 为单位平均，而不是按 token 数重复加权。
+3. 每条轨迹的所有 turn 通过一个 `asyncio.gather` 批次并发请求 DeepSeek，使用有界 semaphore、批内去重、跨 step LRU 缓存、有限重试和 API 健康指标。
+4. 提示词明确要求比较 `s_t,a_t,s_{t+1}`，设置/重定位动作可以是正向；最后非空行必须是 `FINAL_SCORE: 1/0/-1`。最终行解析失败、空响应、认证/网络失败都按需求记为 `-1`，padding 不参与训练。
+5. 轨迹成功严格映射为 `+1`，失败、截断或缺失 success 字段映射为 `-1`。默认 `outcome_broadcast=all_turns`，每个 turn 的直接分数为 `label_weight * judge + outcome_weight * outcome`，并以 turn 末端 reward 形式接入 PPO。
+
+### 验证结果
+
+- 针对性测试：`31 passed`（`tests/test_generative_critic_api.py`、`tests/test_turn_ppo_core.py`、Sokoban/env、seed iteration、rollout filter），只有 Gym/Ray 的既有弃用警告。
+- `/home/kangshijia/venvs/ragen/bin/python -m compileall -q ragen tests train.py`：通过。
+- 目标脚本及旧 launcher `bash -n`：通过；`git diff --check`：通过。
+- `DRY_RUN=1` 小 batch Hydra 预检返回码 0，解析了完整配置但没有启动 Ray、模型或 API。日志：`/tmp/llmcritic-dryrun-20260828.log`。
+- 无密钥启动预检在模型/Ray 初始化前返回码 1，并明确提示 `DEEPSEEK_API_KEY` 缺失。日志：`/tmp/llmcritic-script-no-key-20260828.log`。
+- 全量 pytest 仍会在收集阶段受服务器缺失可选依赖、重复外部测试包等环境问题阻塞；这不等同于本实现的断言失败，详见上面的历史测试状态。
+
+### 正式训练状态
+
+本次没有伪造训练曲线：当前 shell 没有 `DEEPSEEK_API_KEY`/`WANDB_API_KEY`，且 8 张 GPU 均处于约 94--97% 显存占用、100% 利用率（属于其他任务）；因此没有启动会抢占资源或产生 API 费用的正式 run，也没有新的 checkpoint/W&B 指标。脚本已经准备好，取得预留 GPU 和运行时凭据后可用如下方式启动：
+
+```bash
+cd /home/kangshijia/wangbinyu/llm-critic
+export DEEPSEEK_API_KEY='在 shell 外部注入，勿写入命令历史/配置'
+export WANDB_API_KEY='可选；缺失时脚本自动使用 offline'
+CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-chat \
+  bash train_sokoban_deepseek_turn_ppo.sh
+```
+
+第一次正式运行建议先使用 `TOTAL_STEPS=1 TRAIN_ENV_GROUPS=1 TRAIN_GROUP_SIZE=1 VAL_ENV_GROUPS=1 VAL_GROUP_SIZE=1`，确认 W&B 中 `gen_critic/api_failure_rate`、`gen_critic/parse_fail_rate`、`train/outcome_success_rate`、`train/turn_count` 和 actor `pg_clipfrac` 正常，再扩大 batch/步数。
+
+### 算法判断与后续建议
+
+把一个完整 turn 视为 SMDP/macro action，在行为策略 tokenization 不变时使用 token 概率乘积（log-prob 求和）是数学上成立的 PPO 目标；相关 turn-level PPO 和 macro-action 文献包括 [Turn-PPO](https://arxiv.org/html/2512.17008) 与 [MA-RLHF](https://arxiv.org/html/2410.02743)。但 DeepSeek 的 `-1/0/+1` 是冻结 judge 的启发式 reward，不是无偏 advantage：judge 偏差、状态截断、提示注入和 API 失败会直接改变策略梯度。
+
+建议固定总 token 预算跑至少 3 个 seed，并保留以下对照：token-PPO baseline、仅 terminal outcome、oracle Sokoban progress、DeepSeek progress、`label+outcome`、随机/噪声 judge。每个 run 记录 turn 长度、ratio 分位数/clip fraction、KL、有效动作率、judge 失败率和独立 verifier 的 success。长 turn 的 raw product 容易快速越过 PPO clip，可增加 geometric-mean ratio 对照；[GSPO](https://arxiv.org/html/2507.18071v2) 和 [ST-PPO](https://arxiv.org/html/2511.20718) 讨论了这一稳定性问题。若希望 shaping 不改变最优策略，应把进度分数校准为 potential difference `gamma*Phi(s')-Phi(s)`，而不是无条件复制 terminal reward；参见 [Ng et al.](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf)。
+
+当前 launcher 采用直接 turn advantage、关闭 trainable value critic，因此完全覆盖用户指定的 `judge + outcome` 目标。精确 trace builder 为保持行为策略一致而一 turn 一行；若以后开启 value critic，需要按 `episode_ids` 在行之间恢复跨 turn GAE，不能把每一行当成独立 episode。另一个应做的 ablation 是 `outcome_broadcast=last_turn`，因为 `all_turns` 会重复终局信号并可能放大长轨迹权重。
+
+### 凭据处置
+
+用户消息中出现过 DeepSeek key，且旧仓库历史曾出现 W&B token。即使工作树已清理，也不能消除 Git 历史或服务端日志中的泄露；在正式运行前应立即吊销并轮换两类凭据，改用临时环境变量/secret manager。
