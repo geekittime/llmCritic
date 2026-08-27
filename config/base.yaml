@@ -108,10 +108,13 @@ generative_critic:
   model_path: ${model_path}
   # DeepSeek API critic settings.  Keep the key out of YAML and shell command
   # lines; export DEEPSEEK_API_KEY in the runtime environment instead.
-  deepseek_model: deepseek-chat
+  # deepseek-chat was deprecated by the provider in July 2026; use the
+  # current lower-cost non-thinking Flash endpoint by default.
+  deepseek_model: deepseek-v4-flash
   deepseek_api_base: https://api.deepseek.com
   deepseek_api_key_env: DEEPSEEK_API_KEY
   deepseek_api_key: null
+  deepseek_thinking: disabled # disabled keeps the short score response deterministic
   deepseek_timeout: 30.0
   deepseek_max_retries: 2
   deepseek_max_concurrency: 16

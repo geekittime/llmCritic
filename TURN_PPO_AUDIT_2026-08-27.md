@@ -198,6 +198,7 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 | `e116389` | 初始代码审计、历史运行记录和风险清单 |
 | `ac242d1` | DeepSeek signed turn-PPO 实现、精确 token trace、并行 critic、worker wiring、测试和启动脚本 |
 | `3088304` | Ray worker 运行时凭据转发（仅从环境变量读取）以及 legacy critic 默认配置兼容修正 |
+| （本次修正） | 切换到官方当前 `deepseek-v4-flash`，显式关闭 thinking，并将模式纳入请求缓存键 |
 
 当前分支为 `feature/turn-ppo-deepseek-progress`。实现提交没有把 DeepSeek 或 W&B 凭据写入 YAML、shell 参数或日志；Ray 启动时只转发进程环境中已经存在的对应变量。
 
@@ -220,13 +221,13 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 
 ### 正式训练状态
 
-本次没有伪造训练曲线：当前 shell 没有 `DEEPSEEK_API_KEY`/`WANDB_API_KEY`，且 8 张 GPU 均处于约 94--97% 显存占用、100% 利用率（属于其他任务）；因此没有启动会抢占资源或产生 API 费用的正式 run，也没有新的 checkpoint/W&B 指标。脚本已经准备好，取得预留 GPU 和运行时凭据后可用如下方式启动：
+本次没有伪造训练曲线：当前 shell 没有 `DEEPSEEK_API_KEY`/`WANDB_API_KEY`，且 8 张 GPU 均处于约 94--97% 显存占用、100% 利用率（属于其他任务）；因此没有启动会抢占资源或产生 API 费用的正式 run，也没有新的 checkpoint/W&B 指标。脚本默认使用官方当前的 `deepseek-v4-flash` 非思考模式；取得预留 GPU 和运行时凭据后可用如下方式启动：
 
 ```bash
 cd /home/kangshijia/wangbinyu/llm-critic
 export DEEPSEEK_API_KEY='在 shell 外部注入，勿写入命令历史/配置'
 export WANDB_API_KEY='可选；缺失时脚本自动使用 offline'
-CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-chat \
+CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-v4-flash \
   bash train_sokoban_deepseek_turn_ppo.sh
 ```
 
@@ -234,7 +235,7 @@ CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-chat \
 
 ### 算法判断与后续建议
 
-把一个完整 turn 视为 SMDP/macro action，在行为策略 tokenization 不变时使用 token 概率乘积（log-prob 求和）是数学上成立的 PPO 目标；相关 turn-level PPO 和 macro-action 文献包括 [Turn-PPO](https://arxiv.org/html/2512.17008) 与 [MA-RLHF](https://arxiv.org/html/2410.02743)。但 DeepSeek 的 `-1/0/+1` 是冻结 judge 的启发式 reward，不是无偏 advantage：judge 偏差、状态截断、提示注入和 API 失败会直接改变策略梯度。
+把一个完整 turn 视为 SMDP/macro action，在行为策略 tokenization 不变时使用 token 概率乘积（log-prob 求和）是数学上成立的 PPO 目标；相关 turn-level PPO 和 macro-action 文献包括 [Turn-PPO](https://arxiv.org/html/2512.17008) 与 [MA-RLHF](https://arxiv.org/html/2410.02743)。截至本记录日期，DeepSeek 官方文档列出的当前低价模型是 `deepseek-v4-flash`，而 `deepseek-chat`/`deepseek-reasoner` 已被标为兼容旧名称并进入弃用路径；价格和可用模型应以 [官方定价页](https://api-docs.deepseek.com/quick_start/pricing/) 与 [模型列表](https://api-docs.deepseek.com/api/list-models/) 为准。 但 DeepSeek 的 `-1/0/+1` 是冻结 judge 的启发式 reward，不是无偏 advantage：judge 偏差、状态截断、提示注入和 API 失败会直接改变策略梯度。
 
 建议固定总 token 预算跑至少 3 个 seed，并保留以下对照：token-PPO baseline、仅 terminal outcome、oracle Sokoban progress、DeepSeek progress、`label+outcome`、随机/噪声 judge。每个 run 记录 turn 长度、ratio 分位数/clip fraction、KL、有效动作率、judge 失败率和独立 verifier 的 success。长 turn 的 raw product 容易快速越过 PPO clip，可增加 geometric-mean ratio 对照；[GSPO](https://arxiv.org/html/2507.18071v2) 和 [ST-PPO](https://arxiv.org/html/2511.20718) 讨论了这一稳定性问题。若希望 shaping 不改变最优策略，应把进度分数校准为 potential difference `gamma*Phi(s')-Phi(s)`，而不是无条件复制 terminal reward；参见 [Ng et al.](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf)。
 

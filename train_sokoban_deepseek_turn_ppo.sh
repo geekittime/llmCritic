@@ -53,7 +53,7 @@ if [[ "${N_GPUS}" -ne "${#GPU_IDS[@]}" ]]; then
     exit 2
 fi
 
-RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-chat}"
+RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
 PROJECT_NAME="${WANDB_PROJECT}"
 
 # Keep defaults modest enough for a first validation run.  Increase the group
@@ -68,7 +68,7 @@ TOTAL_STEPS="${TOTAL_STEPS:-2000}"
 MAX_TURN="${MAX_TURN:-5}"
 MAX_ACTIONS_PER_TURN="${MAX_ACTIONS_PER_TURN:-1}"
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-40}"
-DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-chat}"
+DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-v4-flash}"
 
 # A fresh run is the default; set RESUME_MODE=auto/resume_path explicitly when
 # continuing a known checkpoint.  ``DRY_RUN=1`` asks Hydra to render the fully
@@ -103,6 +103,7 @@ TRAIN_ARGS=(
     "generative_critic.response_format=score_only"
     "generative_critic.deepseek_model=${DEEPSEEK_MODEL}"
     "generative_critic.deepseek_api_key_env=DEEPSEEK_API_KEY"
+    "generative_critic.deepseek_thinking=${DEEPSEEK_THINKING:-disabled}"
     "generative_critic.deepseek_timeout=${DEEPSEEK_TIMEOUT:-30}"
     "generative_critic.deepseek_max_retries=${DEEPSEEK_MAX_RETRIES:-2}"
     "generative_critic.deepseek_max_concurrency=${DEEPSEEK_MAX_CONCURRENCY:-16}"

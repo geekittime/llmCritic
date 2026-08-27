@@ -80,6 +80,17 @@ def test_api_backend_forces_integer_protocol_when_base_config_is_legacy():
     assert critic.response_format == "score_only"
 
 
+def test_deepseek_request_disables_thinking_by_default():
+    critic = FrozenGenerativeCritic(_config())
+    assert critic.deepseek_model == "deepseek-v4-flash"
+    assert critic.deepseek_thinking == "disabled"
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: 0")
+    critic._deepseek_client = fake
+    critic._generate_texts(["one"])
+    request = fake.chat.completions.calls[0]
+    assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
 def test_environment_key_takes_precedence_over_config(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-key")
     critic = FrozenGenerativeCritic(_config(deepseek_api_key="config-key"))

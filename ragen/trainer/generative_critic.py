@@ -184,8 +184,11 @@ class FrozenGenerativeCritic:
         # launchers; new scripts should leave it null and export the named env
         # variable.  The environment value wins over a stale CLI/config value,
         # and we never print either value or include it in metrics.
-        model_value = OmegaConf.select(config, "generative_critic.deepseek_model", default="deepseek-chat")
-        self.deepseek_model = str(model_value or "deepseek-chat")
+        model_value = OmegaConf.select(config, "generative_critic.deepseek_model", default="deepseek-v4-flash")
+        self.deepseek_model = str(model_value or "deepseek-v4-flash")
+        thinking_value = OmegaConf.select(config, "generative_critic.deepseek_thinking", default="disabled")
+        thinking_text = str(thinking_value or "disabled").strip().lower()
+        self.deepseek_thinking = thinking_text if thinking_text in {"enabled", "disabled"} else "disabled"
         base_value = OmegaConf.select(
             config, "generative_critic.deepseek_api_base", default="https://api.deepseek.com"
         )
@@ -936,14 +939,21 @@ class FrozenGenerativeCritic:
         for attempt in range(attempts):
             try:
                 async with semaphore:
-                    response = client.chat.completions.create(
-                        model=self.deepseek_model,
-                        messages=self._build_deepseek_messages(self._truncate_deepseek_prompt(prompt)),
-                        max_tokens=self.deepseek_max_tokens,
-                        temperature=self.temperature if self.do_sample else 0.0,
-                        top_p=self.top_p if self.do_sample else 1.0,
-                        timeout=self.deepseek_timeout,
-                    )
+                    request_kwargs = {
+                        "model": self.deepseek_model,
+                        "messages": self._build_deepseek_messages(self._truncate_deepseek_prompt(prompt)),
+                        "max_tokens": self.deepseek_max_tokens,
+                        "temperature": self.temperature if self.do_sample else 0.0,
+                        "top_p": self.top_p if self.do_sample else 1.0,
+                        "timeout": self.deepseek_timeout,
+                    }
+                    # DeepSeek-V4 enables reasoning by default.  The critic
+                    # only needs a short deterministic score; explicitly turn
+                    # reasoning off so the final score is not truncated by a
+                    # tiny max_tokens budget.  ``extra_body`` is the supported
+                    # OpenAI-SDK escape hatch for provider-specific fields.
+                    request_kwargs["extra_body"] = {"thinking": {"type": self.deepseek_thinking}}
+                    response = client.chat.completions.create(**request_kwargs)
                     if inspect.isawaitable(response):
                         response = await response
                 choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
@@ -1002,6 +1012,7 @@ class FrozenGenerativeCritic:
                 _CACHE_PROTOCOL_VERSION,
                 self.deepseek_api_base,
                 self.deepseek_model,
+                self.deepseek_thinking,
                 str(self.temperature if self.do_sample else 0.0),
                 str(self.top_p if self.do_sample else 1.0),
                 str(self.deepseek_max_tokens),
