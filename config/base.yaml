@@ -121,7 +121,9 @@ generative_critic:
   deepseek_cache_size: 4096
   deepseek_max_prompt_chars: 12000
   response_format: structured # structured (legacy bool) | score_only (integer -1/0/1)
-  parse_fail_score: -1
+  # Null keeps legacy local critics' boolean fallback; the DeepSeek launcher
+  # explicitly sets this to -1 as required by the signed API protocol.
+  parse_fail_score: null
   train_enable: False
   train_strategy: actor_ppo
   train_model_path: ${model_path}

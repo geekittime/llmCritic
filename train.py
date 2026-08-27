@@ -228,13 +228,26 @@ def run_ppo(config) -> None:
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
         # this is for local ray cluster
+        # Ray normally inherits the driver's environment, but an explicit
+        # runtime_env (and remote clusters in particular) may not.  Forward
+        # only credentials that are already present in the process environment;
+        # do not put them into the Hydra config or print them in diagnostics.
+        ray_env_vars = {
+            'TOKENIZERS_PARALLELISM': 'true',
+            'NCCL_DEBUG': 'WARN',
+            'VLLM_LOGGING_LEVEL': 'WARN',
+            "RAY_DEBUG": "legacy",  # used here for simpler breakpoint()
+        }
+        critic_cfg = config.get("generative_critic", {})
+        critic_backend = str(critic_cfg.get("backend", "transformers")).lower()
+        if critic_backend in {"deepseek", "deepseek_api"}:
+            key_env = str(critic_cfg.get("deepseek_api_key_env", "DEEPSEEK_API_KEY"))
+            if os.environ.get(key_env):
+                ray_env_vars[key_env] = os.environ[key_env]
+        if os.environ.get("WANDB_API_KEY"):
+            ray_env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
         ray.init(runtime_env={
-            'env_vars': {
-                'TOKENIZERS_PARALLELISM': 'true',
-                'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN',
-                "RAY_DEBUG": "legacy" # used here for simpler breakpoint()
-            }
+            'env_vars': ray_env_vars
         })
 
     runner = TaskRunner.remote()
