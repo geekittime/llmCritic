@@ -198,7 +198,7 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 | `e116389` | 初始代码审计、历史运行记录和风险清单 |
 | `ac242d1` | DeepSeek signed turn-PPO 实现、精确 token trace、并行 critic、worker wiring、测试和启动脚本 |
 | `3088304` | Ray worker 运行时凭据转发（仅从环境变量读取）以及 legacy critic 默认配置兼容修正 |
-| （本次修正） | 切换到官方当前 `deepseek-v4-flash`，显式关闭 thinking，并将模式纳入请求缓存键 |
+| `61f56ca` | 切换到官方当前 `deepseek-v4-flash`，显式关闭 thinking，并将模式纳入请求缓存键 |
 
 当前分支为 `feature/turn-ppo-deepseek-progress`。实现提交没有把 DeepSeek 或 W&B 凭据写入 YAML、shell 参数或日志；Ray 启动时只转发进程环境中已经存在的对应变量。
 
@@ -212,10 +212,11 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 
 ### 验证结果
 
-- 针对性测试：`31 passed`（`tests/test_generative_critic_api.py`、`tests/test_turn_ppo_core.py`、Sokoban/env、seed iteration、rollout filter），只有 Gym/Ray 的既有弃用警告。
+- 针对性测试：`32 passed`（`tests/test_generative_critic_api.py`、`tests/test_turn_ppo_core.py`、Sokoban/env、seed iteration、rollout filter），只有 Gym/Ray 的既有弃用警告；其中新增测试确认默认 Flash 请求带 `thinking=disabled`。
 - `/home/kangshijia/venvs/ragen/bin/python -m compileall -q ragen tests train.py`：通过。
 - 目标脚本及旧 launcher `bash -n`：通过；`git diff --check`：通过。
 - `DRY_RUN=1` 小 batch Hydra 预检返回码 0，解析了完整配置但没有启动 Ray、模型或 API。日志：`/tmp/llmcritic-dryrun-20260828.log`。
+- 在 `61f56ca` 后再次用 `deepseek-v4-flash` 预检返回码 0；解析到 `deepseek_model: deepseek-v4-flash`、`deepseek_thinking: disabled` 和 `parse_fail_score: -1`。日志：`/tmp/llmcritic-dryrun-v4-20260828.log`。
 - 无密钥启动预检在模型/Ray 初始化前返回码 1，并明确提示 `DEEPSEEK_API_KEY` 缺失。日志：`/tmp/llmcritic-script-no-key-20260828.log`。
 - 全量 pytest 仍会在收集阶段受服务器缺失可选依赖、重复外部测试包等环境问题阻塞；这不等同于本实现的断言失败，详见上面的历史测试状态。
 
