@@ -1,32 +1,12 @@
-import sys
-import types
-
 import numpy as np
+import pytest
 import torch
 from tensordict import TensorDict
 
-
-if "verl" not in sys.modules:
-    stub = types.ModuleType("verl")
-
-    class DummyDataProto:
-        def __init__(self, batch=None, non_tensor_batch=None, meta_info=None):
-            self.batch = batch
-            self.non_tensor_batch = non_tensor_batch or {}
-            self.meta_info = meta_info or {}
-
-        def union(self, other):
-            if other.batch is not None:
-                for key, value in other.batch.items():
-                    self.batch[key] = value
-            if other.non_tensor_batch:
-                self.non_tensor_batch.update(other.non_tensor_batch)
-            if other.meta_info:
-                self.meta_info.update(other.meta_info)
-            return self
-
-    stub.DataProto = DummyDataProto
-    sys.modules["verl"] = stub
+try:
+    from verl import DataProto
+except ImportError:  # pragma: no cover - the project test env provides verl
+    pytest.skip("verl is required for rollout-filter tests", allow_module_level=True)
 
 
 from ragen.trainer.rollout_filter import (
@@ -48,7 +28,7 @@ def _make_reward_batch(num_groups: int, group_size: int, traj_len: int):
         batch_size=[total],
     )
     non_tensor_batch = {"uids": np.arange(total)}
-    return sys.modules["verl"].DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={})
+    return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={})
 
 
 def test_reward_variance_filter_reduces_batch_size():
@@ -85,7 +65,7 @@ def test_entropy_variance_filter_uses_compute_log_prob():
             },
             batch_size=[num_groups * group_size],
         )
-        return sys.modules["verl"].DataProto(batch=td, non_tensor_batch={}, meta_info={})
+        return DataProto(batch=td, non_tensor_batch={}, meta_info={})
 
     rollout_filter = EntropyRolloutFilter(
         RolloutFilterConfig(
@@ -135,3 +115,40 @@ def test_reward_metric_selects_high_mean_group():
     # Highest mean group is the first one, so we expect its entries to remain.
     retained = filtered_batch.batch["original_rm_scores"].squeeze(-1)
     assert torch.allclose(retained, torch.tensor([10.0, 11.0]))
+
+
+def test_turn_filter_aggregates_all_rows_of_each_episode():
+    # Exact turn traces contain one row per turn, and episodes can have
+    # different numbers of turns.  The terminal score must be aggregated by
+    # episode before comparing groups; taking the first row would select the
+    # wrong group here.
+    scores = torch.tensor([[0.0], [1.0], [0.0], [2.0], [0.0], [1.0]])
+    batch = TensorDict(
+        {
+            "original_rm_scores": scores,
+            "loss_mask": torch.ones_like(scores),
+        },
+        batch_size=[6],
+    )
+    proto = DataProto(
+        batch=batch,
+        non_tensor_batch={
+            "episode_ids": np.array([0, 0, 1, 2, 2, 3]),
+            "group_ids": np.array([0, 0, 0, 1, 1, 1]),
+            "env_ids": np.arange(6),
+        },
+        meta_info={},
+    )
+    rollout_filter = RewardRolloutFilter(
+        RolloutFilterConfig(
+            ratio=0.5,
+            filter_type="largest",
+            num_groups=2,
+            group_size=2,
+            metric="reward",
+        )
+    )
+
+    filtered, _ = rollout_filter.filter(proto)
+
+    assert filtered.non_tensor_batch["env_ids"].tolist() == [3, 4, 5]

@@ -85,9 +85,17 @@ algorithm:
   high_level_gamma: 0.95
   adv_estimator: gae
   bi_level_gae: False
-  use_label_outcome_advantage: True
+  # The signed turn-PPO path is opt-in so legacy single/limited-turn
+  # launchers keep their original token-level advantage behavior.  The
+  # DeepSeek launcher enables this explicitly.
+  use_label_outcome_advantage: False
   label_weight: 1.0
   outcome_weight: 1.0
+  outcome_broadcast: all_turns # all_turns (requested objective) | last_turn | none
+  turn_score_reduction: mean # mean | first | last
+  normalize_turn_advantage: False
+  allow_score_outcome_fallback: False
+  add_kl_to_turn_advantage: True
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
@@ -95,9 +103,25 @@ algorithm:
 
 generative_critic:
   enable: False
-  backend: transformers # transformers | actor_rollout_vllm
+  backend: transformers # transformers | actor_rollout_vllm | deepseek_api
   use_chat_template: True
   model_path: ${model_path}
+  # DeepSeek API critic settings.  Keep the key out of YAML and shell command
+  # lines; export DEEPSEEK_API_KEY in the runtime environment instead.
+  deepseek_model: deepseek-chat
+  deepseek_api_base: https://api.deepseek.com
+  deepseek_api_key_env: DEEPSEEK_API_KEY
+  deepseek_api_key: null
+  deepseek_timeout: 30.0
+  deepseek_max_retries: 2
+  deepseek_max_concurrency: 16
+  deepseek_max_tokens: 32
+  deepseek_raise_on_error: False
+  deepseek_cache_enable: True
+  deepseek_cache_size: 4096
+  deepseek_max_prompt_chars: 12000
+  response_format: structured # structured (legacy bool) | score_only (integer -1/0/1)
+  parse_fail_score: -1
   train_enable: False
   train_strategy: actor_ppo
   train_model_path: ${model_path}
@@ -153,6 +177,9 @@ agent_proxy:
   max_actions_per_turn: 2 # how many actions can be output at most in a single turn
   use_turn_scores: False # important to GAE when applying token-level rewards to token-level advantages. If False, will take the sum of scores as the reward for the last turn.
   debug_turn_boundary: False
+  # Exact rollout token traces are required by turn PPO.  Set true only for
+  # explicitly audited legacy checkpoints that have no raw token IDs.
+  allow_legacy_retokenization: False
   enable_think: True # False -> no think RL
   reward_normalization:
     grouping: "state" # state / batch / inductive

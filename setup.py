@@ -31,6 +31,7 @@ base_requires = [
     "debugpy",
     "together",
     "anthropic",
+    "openai>=1.0",
     "faiss-cpu==1.11.0",
 ]
 

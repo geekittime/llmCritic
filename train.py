@@ -15,6 +15,40 @@ from ragen.utils import register_resolvers
 register_resolvers()
 import sys
 import socket
+import re
+from collections.abc import Mapping
+
+
+_SECRET_CONFIG_KEY = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|auth(?:orization)?|token|secret|password|credential)",
+    re.IGNORECASE,
+)
+
+
+def _redact_config(value, key_name: str = ""):
+    """Return a log-safe copy of a Hydra config without mutating it.
+
+    The trainer prints the resolved config from both the driver and a Ray
+    worker.  Redacting by key keeps an accidentally supplied API credential
+    out of those logs while preserving useful run diagnostics.  Launchers
+    should still keep secrets out of Hydra overrides because Hydra may persist
+    those overrides in its run directory.
+    """
+    from omegaconf import DictConfig, ListConfig, OmegaConf
+
+    if _SECRET_CONFIG_KEY.search(key_name):
+        if value is None or value == "":
+            return value
+        return "<redacted>"
+    if isinstance(value, DictConfig):
+        value = OmegaConf.to_container(value, resolve=True)
+    elif isinstance(value, ListConfig):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, Mapping):
+        return {str(key): _redact_config(item, str(key)) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_config(item, key_name) for item in value]
+    return value
 
 class DummyRewardManager():
     """The reward manager.
@@ -148,6 +182,29 @@ def add_dependency_and_validate_config(config):
     assert config.algorithm.bi_level_gae == False or (not config.agent_proxy.use_turn_scores), "BI_LEVEL_GAE is enabled, but currently use_turn_scores are not correctly supported, so config.agent_proxy.use_turn_scores should be set to False" # This will be added later. Currently turn-scores are not correctly supported yet.
     # assert config.algorithm.bi_level_gae == False or config.agent_proxy.use_turn_scores, "BI_LEVEL_GAE is enabled, so config.agent_proxy.use_turn_scores should be set to True" # This will be added later. Currently turn-scores are not correctly supported yet.
 
+    # The exact turn-PPO path relies on the original rollout token traces.
+    # Fail at launch time instead of silently falling back to a different
+    # probability model or producing an unaligned loss mask.
+    use_turn_ppo = bool(config.algorithm.get("use_label_outcome_advantage", False))
+    if use_turn_ppo and context_window_mode != "full":
+        raise ValueError(
+            "algorithm.use_label_outcome_advantage requires agent_proxy.context_window_mode=full "
+            "so each sampled turn can retain exact prompt/response token IDs"
+        )
+
+    critic_enabled = bool(config.get("generative_critic", {}).get("enable", False))
+    critic_backend = str(config.get("generative_critic", {}).get("backend", "transformers")).lower()
+    if use_turn_ppo and critic_enabled and critic_backend in {"deepseek", "deepseek_api"}:
+        key_env = str(
+            config.get("generative_critic", {}).get("deepseek_api_key_env", "DEEPSEEK_API_KEY")
+        )
+        configured_key = config.get("generative_critic", {}).get("deepseek_api_key", None)
+        if not os.environ.get(key_env, "").strip() and not str(configured_key or "").strip():
+            raise RuntimeError(
+                f"DeepSeek critic is enabled but {key_env} is not set. "
+                "Export the key in the launch environment; do not put it in Hydra overrides."
+            )
+
     # add dependency
     config.data.train_batch_size = config.es_manager.train.env_groups * config.es_manager.train.group_size
 
@@ -158,7 +215,7 @@ def add_dependency_and_validate_config(config):
 @hydra.main(version_base=None, config_path="config", config_name="base")
 def main(config):
     config = add_dependency_and_validate_config(config)
-    print(f"config: {config}")
+    print(f"config: {_redact_config(config)}")
 
     run_ppo(config)
 
@@ -195,7 +252,7 @@ class TaskRunner:
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
+        pprint(_redact_config(OmegaConf.to_container(config, resolve=True)))
         OmegaConf.resolve(config)
 
         # download the checkpoint from hdfs

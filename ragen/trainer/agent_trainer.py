@@ -166,7 +166,18 @@ def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> Dat
     return adjusted_batch
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, bi_level_gae=False, high_level_gamma=1.0):
+def compute_advantage(
+    data: DataProto,
+    adv_estimator,
+    gamma=1.0,
+    lam=1.0,
+    num_repeat=1,
+    multi_turn=False,
+    norm_adv_by_std_in_grpo=True,
+    bi_level_gae=False,
+    high_level_gamma=1.0,
+    normalize_turn_advantage: bool = True,
+):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
@@ -192,6 +203,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 turn_value_ids=data.batch["turn_value_ids"],
                 gamma=gamma,
                 lam=lam,
+                normalize_advantages=normalize_turn_advantage,
             )
         else:
             advantages, returns = core_algos.compute_gae_advantage_return(
@@ -258,6 +270,175 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     else:
         raise NotImplementedError
     return data
+
+
+def _validate_turn_tensor_shapes(
+    turn_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    *tensors: Optional[torch.Tensor],
+) -> None:
+    """Validate the parallel tensors used by the macro-action path."""
+    if turn_ids.ndim != 2 or response_mask.shape != turn_ids.shape:
+        raise ValueError(
+            "turn_ids and response_mask must be rank-2 tensors with identical shapes; "
+            f"got {tuple(turn_ids.shape)} and {tuple(response_mask.shape)}"
+        )
+    for tensor in tensors:
+        if tensor is not None and tensor.shape != turn_ids.shape:
+            raise ValueError(
+                "turn metadata shape does not match turn_ids: "
+                f"{tuple(tensor.shape)} vs {tuple(turn_ids.shape)}"
+            )
+
+
+def collapse_turn_scores(
+    token_scores: torch.Tensor,
+    turn_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Collapse a token tensor to one signed scalar per macro action.
+
+    ``turn_ids`` identifies the sampled tokens belonging to each turn.  The
+    returned tensor has the original shape, but every valid token in a turn
+    carries the same scalar.  This is the representation consumed by the
+    turn-PPO actor (which reads one advantage per turn and sums token log
+    probabilities).  Padding/environment tokens are always zero.
+    """
+    _validate_turn_tensor_shapes(turn_ids, response_mask, token_scores)
+    if reduction not in {"mean", "first", "last"}:
+        raise ValueError(f"Unsupported turn score reduction: {reduction}")
+
+    scores = torch.zeros_like(token_scores, dtype=torch.float32)
+    valid = response_mask > 0
+    for batch_index in range(turn_ids.shape[0]):
+        ids = torch.unique(turn_ids[batch_index][valid[batch_index]], sorted=True)
+        for turn_id in ids.tolist():
+            mask = (turn_ids[batch_index] == turn_id) & valid[batch_index]
+            values = token_scores[batch_index, mask].float()
+            if values.numel() == 0:
+                continue
+            if reduction == "first":
+                scalar = values[0]
+            elif reduction == "last":
+                scalar = values[-1]
+            else:
+                scalar = values.mean()
+            scores[batch_index, mask] = scalar
+    return scores.to(dtype=token_scores.dtype)
+
+
+def place_turn_endpoint_rewards(
+    turn_scores: torch.Tensor,
+    turn_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_end_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Write one reward at each turn's end boundary.
+
+    A reward at every token would make long completions receive a larger
+    return.  Endpoint-only placement keeps the reward invariant to the number
+    of generated tokens while preserving the token-shaped VERL interface.
+    """
+    _validate_turn_tensor_shapes(turn_ids, response_mask, turn_scores, turn_end_mask)
+    valid = response_mask > 0
+    endpoint_rewards = torch.zeros_like(turn_scores, dtype=torch.float32)
+    for batch_index in range(turn_ids.shape[0]):
+        ids = torch.unique(turn_ids[batch_index][valid[batch_index]], sorted=True)
+        for turn_id in ids.tolist():
+            token_mask = (turn_ids[batch_index] == turn_id) & valid[batch_index]
+            positions = torch.nonzero(token_mask, as_tuple=True)[0]
+            if positions.numel() == 0:
+                continue
+            if turn_end_mask is not None:
+                end_positions = torch.nonzero(
+                    token_mask & (turn_end_mask[batch_index] > 0), as_tuple=True
+                )[0]
+                endpoint = end_positions[-1] if end_positions.numel() else positions[-1]
+            else:
+                endpoint = positions[-1]
+            endpoint_rewards[batch_index, endpoint] = turn_scores[batch_index, endpoint]
+    return endpoint_rewards.to(dtype=turn_scores.dtype)
+
+
+def broadcast_outcome_to_turns(
+    outcomes: torch.Tensor,
+    turn_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    mode: str = "all_turns",
+) -> torch.Tensor:
+    """Broadcast one terminal outcome to the requested turn boundaries.
+
+    ``all_turns`` follows the requested objective literally: each turn's
+    advantage receives the trajectory outcome in addition to its critic score.
+    ``last_turn`` is available for the usual terminal-reward ablation.
+    """
+    _validate_turn_tensor_shapes(turn_ids, response_mask)
+    if outcomes.ndim != 1 or outcomes.shape[0] != turn_ids.shape[0]:
+        raise ValueError("outcomes must be a vector with one value per batch item")
+    if mode not in {"all_turns", "last_turn", "none"}:
+        raise ValueError(f"Unsupported outcome broadcast mode: {mode}")
+
+    result = torch.zeros_like(response_mask, dtype=torch.float32)
+    valid = response_mask > 0
+    for batch_index in range(turn_ids.shape[0]):
+        ids = torch.unique(turn_ids[batch_index][valid[batch_index]], sorted=True).tolist()
+        if mode == "last_turn" and ids:
+            ids = ids[-1:]
+        if mode == "none":
+            ids = []
+        for turn_id in ids:
+            result[batch_index, (turn_ids[batch_index] == turn_id) & valid[batch_index]] = outcomes[batch_index]
+    return result.to(device=turn_ids.device)
+
+
+def trajectory_outcomes(
+    data: DataProto,
+    batch_size: int,
+    device: torch.device,
+    allow_score_fallback: bool = False,
+) -> tuple[torch.Tensor, str]:
+    """Return the required binary terminal outcome for each training item.
+
+    The environment writes ``trajectory_success`` after rollout finalization.
+    A successful complete trajectory maps to ``+1`` and every failure or
+    truncation maps to ``-1``.  We deliberately do not infer success from a
+    shaped numeric reward unless the caller explicitly opts into the legacy
+    fallback, because a failed Sokoban episode can still accumulate a positive
+    intermediate score.
+    """
+    non_tensor = data.non_tensor_batch or {}
+    raw = None
+    source = "missing"
+    for key in ("trajectory_success", "is_success", "success"):
+        if key in non_tensor:
+            raw = non_tensor[key]
+            source = key
+            break
+
+    if raw is None and allow_score_fallback:
+        score_tensor = data.batch.get("token_level_scores", None)
+        response_mask = data.batch.get("response_mask", None)
+        if score_tensor is not None and response_mask is not None:
+            raw = ((score_tensor.float() * response_mask.float()).sum(dim=-1) > 0).detach().cpu().numpy()
+            source = "legacy_score_fallback"
+
+    if raw is None:
+        return torch.full((batch_size,), -1.0, dtype=torch.float32, device=device), source
+
+    try:
+        values = np.asarray(raw, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("trajectory_success must be a numeric batch vector") from exc
+    if values.size == 1 and batch_size != 1:
+        values = np.repeat(values, batch_size)
+    if values.size != batch_size:
+        raise ValueError(
+            f"trajectory_success length {values.size} does not match batch size {batch_size}"
+        )
+    success = torch.as_tensor(values, dtype=torch.float32, device=device)
+    success = torch.where(torch.isfinite(success) & (success > 0.5), 1.0, -1.0)
+    return success, source
 
 
 class RayAgentTrainer(VerlRayPPOTrainer):
@@ -458,7 +639,15 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 "gen_critic/true_rate": 0.0,
             }, 0.0
 
-        label_tensor = torch.zeros_like(turn_ids, dtype=torch.float32)
+        # Keep the same signed protocol as the frozen/API critic.  A missing
+        # or malformed local-critic response is a negative action score, not a
+        # neutral zero, so changing critic backends cannot change the reward
+        # semantics of turn PPO.
+        label_tensor = torch.where(
+            turn_ids >= 0,
+            torch.full_like(turn_ids, -1, dtype=torch.float32),
+            torch.zeros_like(turn_ids, dtype=torch.float32),
+        )
 
         # Build prompt items from current trajectory content.
         prompt_items = self.generative_critic.build_judge_prompts(messages_list=messages_list, turn_ids=turn_ids)
@@ -491,16 +680,26 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             raise RuntimeError("Trainable critic inference output has no textual responses")
 
         parse_fail = 0
-        true_count = 0
+        positive_count = 0
+        neutral_count = 0
+        negative_count = 0
         for item, text in zip(prompt_items, outputs, strict=True):
-            parsed = self.generative_critic.parse_label(text)
-            if parsed is None:
+            parsed_score = self.generative_critic._parse_score_optional(text)
+            if parsed_score is None:
+                # Older trainable checkpoints emit ###label: True/False.
+                # Preserve that wire format while mapping False to the signed
+                # negative progress score required by turn PPO.
+                legacy_label = self.generative_critic.parse_label(text)
+                if legacy_label is not None:
+                    parsed_score = 1 if legacy_label else -1
+            if parsed_score is None:
                 parse_fail += 1
-                parsed = self.generative_critic.default_label_if_parse_fail
+                parsed_score = -1
 
-            value = 1.0 if parsed else 0.0
-            if value > 0.5:
-                true_count += 1
+            value = float(self.generative_critic._normalise_score(int(parsed_score)))
+            positive_count += int(value == 1.0)
+            neutral_count += int(value == 0.0)
+            negative_count += int(value == -1.0)
             mask = turn_ids[item.sample_index] == item.turn_id
             label_tensor[item.sample_index, mask] = value
 
@@ -510,7 +709,10 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             "gen_critic/used_trainable_critic": 1.0,
             "gen_critic/num_prompts": n,
             "gen_critic/parse_fail_rate": float(parse_fail) / max(n, 1.0),
-            "gen_critic/true_rate": float(true_count) / max(n, 1.0),
+            "gen_critic/true_rate": float(positive_count) / max(n, 1.0),
+            "gen_critic/positive_rate": float(positive_count) / max(n, 1.0),
+            "gen_critic/neutral_rate": float(neutral_count) / max(n, 1.0),
+            "gen_critic/negative_rate": float(negative_count) / max(n, 1.0),
         }
         return label_tensor, metrics, critic_gen_time
 
@@ -1370,44 +1572,168 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                     use_label_outcome_advantage = self.config.algorithm.get("use_label_outcome_advantage", False)
                     if use_label_outcome_advantage:
-                        print("[GEN_CRITIC FLOW] use_label_outcome_advantage=True, entering label inference path")
-                        label_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+                        # One signed scalar is assigned to each macro action:
+                        #   A_t = w_progress * judge(s_t, a_t, s_{t+1})
+                        #       + w_outcome * {+1 if the episode succeeds,
+                        #                      -1 otherwise}.
+                        # The actor then sums token log-probabilities inside
+                        # that turn, which is exactly the probability product
+                        # requested for a turn-level PPO action.
+                        print("[GEN_CRITIC FLOW] using signed turn progress + binary trajectory outcome")
+                        response_mask = batch.batch["response_mask"].float()
+                        turn_ids = batch.batch.get("turn_ids", None)
+                        if turn_ids is None:
+                            raise RuntimeError(
+                                "use_label_outcome_advantage requires turn_ids; "
+                                "enable the exact token-trace full-context builder"
+                            )
+                        _validate_turn_tensor_shapes(turn_ids, response_mask)
+
+                        label_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
                         label_metrics = {"gen_critic/enabled": 0.0}
+                        if self.generative_critic.enabled:
+                            # The critic initializes valid actions to -1 and
+                            # replaces them only when a valid signed response is
+                            # parsed.  Thus a missing/malformed API response is
+                            # a negative turn score by construction.
+                            label_tensor = torch.where(
+                                turn_ids >= 0,
+                                torch.full_like(response_mask, -1.0),
+                                torch.zeros_like(response_mask),
+                            )
+                            if "messages_list" in batch.non_tensor_batch:
+                                messages_list = batch.non_tensor_batch["messages_list"].tolist()
+                                if self.use_trainable_generative_critic and self.use_critic:
+                                    label_tensor, label_metrics, critic_label_gen_time = self._infer_labels_with_trainable_critic(
+                                        messages_list=messages_list,
+                                        turn_ids=turn_ids,
+                                    )
+                                    critic_generation_time += critic_label_gen_time
+                                else:
+                                    label_tensor, label_metrics, _ = self.generative_critic.infer_turn_labels(
+                                        messages_list=messages_list,
+                                        turn_ids=turn_ids,
+                                    )
+                            label_tensor = label_tensor.to(response_mask.device, dtype=torch.float32)
 
-                        if self.generative_critic.enabled and "messages_list" in batch.non_tensor_batch and "turn_ids" in batch.batch:
-                            messages_list = batch.non_tensor_batch["messages_list"].tolist()
-                            if self.use_trainable_generative_critic and self.use_critic:
-                                label_tensor, label_metrics, critic_label_gen_time = self._infer_labels_with_trainable_critic(
-                                    messages_list=messages_list,
-                                    turn_ids=batch.batch["turn_ids"],
-                                )
-                                critic_generation_time += critic_label_gen_time
-                            else:
-                                label_tensor, label_metrics, _ = self.generative_critic.infer_turn_labels(
-                                    messages_list=messages_list,
-                                    turn_ids=batch.batch["turn_ids"],
-                                )
-                            label_tensor = label_tensor.to(batch.batch["response_mask"].device)
+                        label_turn = collapse_turn_scores(
+                            label_tensor,
+                            turn_ids=turn_ids,
+                            response_mask=response_mask,
+                            reduction=str(self.config.algorithm.get("turn_score_reduction", "mean")),
+                        )
 
-                        outcome_tensor = self._compute_outcome_tensor(
-                            token_level_scores=batch.batch["token_level_scores"],
-                            response_mask=batch.batch["response_mask"],
+                        outcomes, outcome_source = trajectory_outcomes(
+                            batch,
+                            batch_size=turn_ids.shape[0],
+                            device=response_mask.device,
+                            allow_score_fallback=bool(
+                                self.config.algorithm.get("allow_score_outcome_fallback", False)
+                            ),
+                        )
+                        outcome_mode = str(
+                            self.config.algorithm.get("outcome_broadcast", "all_turns")
+                        )
+                        outcome_turn = broadcast_outcome_to_turns(
+                            outcomes,
+                            turn_ids=turn_ids,
+                            response_mask=response_mask,
+                            mode=outcome_mode,
                         )
 
                         label_weight = float(self.config.algorithm.get("label_weight", 1.0))
                         outcome_weight = float(self.config.algorithm.get("outcome_weight", 1.0))
-                        combined_reward = label_weight * label_tensor + outcome_weight * outcome_tensor
+                        combined_turn = label_weight * label_turn + outcome_weight * outcome_turn
 
-                        batch.batch["token_level_rewards"] = combined_reward
-                        batch.batch["advantages"] = combined_reward
-                        batch.batch["returns"] = combined_reward
+                        # If KL is configured as a reward penalty, retain its
+                        # turn-level contribution instead of silently replacing
+                        # it with the custom reward.  The contribution is
+                        # collapsed before insertion at a turn endpoint so it
+                        # cannot acquire a completion-length bias.
+                        if self.config.algorithm.use_kl_in_reward and bool(
+                            self.config.algorithm.get("add_kl_to_turn_advantage", True)
+                        ):
+                            kl_component = (
+                                batch.batch["token_level_rewards"]
+                                - batch.batch["token_level_scores"]
+                            ).float()
+                            combined_turn = combined_turn + collapse_turn_scores(
+                                kl_component,
+                                turn_ids=turn_ids,
+                                response_mask=response_mask,
+                                reduction="mean",
+                            )
 
+                        endpoint_rewards = place_turn_endpoint_rewards(
+                            combined_turn,
+                            turn_ids=turn_ids,
+                            response_mask=response_mask,
+                            turn_end_mask=batch.batch.get("turn_end_mask", None),
+                        )
+                        batch.batch["token_level_rewards"] = endpoint_rewards
+
+                        # No value model is needed for the requested direct
+                        # turn-PPO objective.  When a value critic is enabled,
+                        # use the same endpoint rewards with turn-level GAE.
+                        use_turn_gae = bool(self.use_critic and "values" in batch.batch)
+                        if use_turn_gae and self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                                multi_turn=True,
+                                high_level_gamma=self.config.algorithm.high_level_gamma,
+                                bi_level_gae=False,
+                                normalize_turn_advantage=bool(
+                                    self.config.algorithm.get("normalize_turn_advantage", True)
+                                ),
+                            )
+                        else:
+                            advantages = combined_turn
+                            if bool(self.config.algorithm.get("normalize_turn_advantage", False)):
+                                valid_values = advantages[response_mask > 0]
+                                if valid_values.numel() > 1:
+                                    advantages = advantages.clone()
+                                    mean = valid_values.mean()
+                                    std = valid_values.std(unbiased=False).clamp_min(1e-6)
+                                    advantages = torch.where(
+                                        response_mask > 0,
+                                        (advantages - mean) / std,
+                                        torch.zeros_like(advantages),
+                                    )
+                            batch.batch["advantages"] = advantages * response_mask
+                            batch.batch["returns"] = combined_turn * response_mask
+
+                        valid_tokens = response_mask > 0
+                        turn_count = sum(
+                            int(torch.unique(turn_ids[index][valid_tokens[index]]).numel())
+                            for index in range(turn_ids.shape[0])
+                            if torch.any(valid_tokens[index])
+                        )
                         metrics.update(label_metrics)
-                        metrics.update({
-                            "train/label_reward_mean": (label_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
-                            "train/outcome_reward_mean": (outcome_tensor * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
-                            "train/combined_reward_mean": (combined_reward * batch.batch["response_mask"]).sum().item() / max(batch.batch["response_mask"].sum().item(), 1.0),
-                        })
+                        metrics.update(
+                            {
+                                "train/turn_count": float(turn_count),
+                                "train/label_reward_mean": float(label_turn[valid_tokens].mean().item())
+                                if torch.any(valid_tokens)
+                                else 0.0,
+                                "train/outcome_reward_mean": float(outcome_turn[valid_tokens].mean().item())
+                                if torch.any(valid_tokens)
+                                else 0.0,
+                                "train/combined_reward_mean": float(combined_turn[valid_tokens].mean().item())
+                                if torch.any(valid_tokens)
+                                else 0.0,
+                                "train/outcome_success_rate": float((outcomes > 0).float().mean().item()),
+                                "train/outcome_failure_rate": float((outcomes < 0).float().mean().item()),
+                                "train/outcome_source_missing": float(outcome_source == "missing"),
+                                "train/outcome_source_trajectory_success": float(
+                                    outcome_source == "trajectory_success"
+                                ),
+                            }
+                        )
 
                     else:
                         # compute advantages, executed on the driver process

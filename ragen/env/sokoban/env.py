@@ -17,7 +17,13 @@ class SokobanEnv(BaseDiscreteActionEnv, GymSokobanEnv):
         self.GRID_LOOKUP = self.config.grid_lookup
         self.ACTION_LOOKUP = self.config.action_lookup
         self.search_depth = self.config.search_depth
-        self.ACTION_SPACE = gym.spaces.discrete.Discrete(4, start=1)
+        # Gymnasium supports ``start`` while Gym 0.21 does not.  Keep the
+        # public action IDs 1..4 where possible and fall back cleanly in the
+        # older ragen environment used by some workers.
+        try:
+            action_space = gym.spaces.discrete.Discrete(4, start=1)
+        except TypeError:
+            action_space = gym.spaces.discrete.Discrete(4)
         self.render_mode = self.config.render_mode
         self.observation_format = self.config.observation_format
 
@@ -29,6 +35,12 @@ class SokobanEnv(BaseDiscreteActionEnv, GymSokobanEnv):
             num_boxes=self.config.num_boxes,
             **kwargs
         )
+        # Gym-Sokoban overwrites ``action_space`` with its native 0-based
+        # space during construction.  Restore the RAGEN action IDs after the
+        # superclass has initialized the room; otherwise metadata and the
+        # actual 1..4 action lookup disagree on Gymnasium versions.
+        self.ACTION_SPACE = action_space
+        self.action_space = action_space
 
     def reset(self, seed=None, mode=None):
         try:
@@ -47,11 +59,31 @@ class SokobanEnv(BaseDiscreteActionEnv, GymSokobanEnv):
             return self.reset(next_seed)
         
     def step(self, action: int):
-        previous_pos = self.player_position
-        _, reward, done, _ = GymSokobanEnv.step(self, action) 
+        # Gym-Sokoban may update ``player_position`` in place.  Copy the
+        # coordinate before stepping so action-effectiveness reflects the
+        # actual transition rather than two references to the same array.
+        previous_pos = np.array(self.player_position, copy=True)
+        result = GymSokobanEnv.step(self, action)
+        if len(result) == 5:
+            _, reward, terminated, truncated, raw_info = result
+            done = bool(terminated or truncated)
+        else:
+            _, reward, done, raw_info = result
+            terminated = bool(done)
+            truncated = False
         next_obs = self.render()
         action_effective = not np.array_equal(previous_pos, self.player_position)
-        info = {"action_is_effective": action_effective, "action_is_valid": True, "success": self.boxes_on_target == self.num_boxes}
+        # Preserve the environment reward/termination fields for metrics and
+        # make the success contract explicit for EnvStateManager.
+        info = dict(raw_info or {})
+        info.update({
+            "action_is_effective": bool(action_effective),
+            "action_is_valid": True,
+            "success": bool(self.boxes_on_target == self.num_boxes),
+            "raw_reward": float(reward),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+        })
         return next_obs, reward, done, info
 
     def render(self, mode=None):

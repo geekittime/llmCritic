@@ -29,6 +29,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base.decorator import (
+    Dispatch,
     register,
     make_nd_compute_dataproto_dispatch_fn,
 )
@@ -68,6 +69,39 @@ class ActorRolloutRefWorker(VerlActorRolloutRefWorker):
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
     or a hybrid engine based on the config.rollout
     """
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Initialize the upstream model and attach RAGEN's turn-aware actor."""
+        super().init_model()
+        from ragen.workers.actor import DataParallelPPOActor as RagenPPOActor
+
+        if self._is_actor:
+            # The upstream worker imports verl.workers.actor.DataParallelPPOActor
+            # internally. Replace that wrapper after model construction so the
+            # FSDP/checkpoint setup remains upstream-compatible while PPO uses
+            # the turn-level macro-action loss.
+            actor_config = self.actor.config
+            self.actor = RagenPPOActor(
+                config=actor_config,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+            )
+            if not isinstance(self.actor, RagenPPOActor):
+                raise RuntimeError("Failed to install RAGEN turn-aware actor wrapper")
+
+        if self._is_ref and hasattr(self, "ref_policy"):
+            ref_config = self.ref_policy.config
+            self.ref_policy = RagenPPOActor(config=ref_config, actor_module=self.ref_module_fsdp)
+
+        if self._is_actor:
+            assert self.actor.__class__.__module__ == RagenPPOActor.__module__, (
+                "Actor worker is not using ragen.workers.actor.DataParallelPPOActor"
+            )
+        if self._is_ref:
+            assert self.ref_policy.__class__.__module__ == RagenPPOActor.__module__, (
+                "Reference worker is not using the RAGEN actor wrapper"
+            )
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -149,12 +183,44 @@ class ActorRolloutRefWorker(VerlActorRolloutRefWorker):
         return output
 
 class AsyncActorRolloutRefWorker(VerlAsyncActorRolloutRefWorker):
-    pass
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Install the same turn-aware actor for async rollout workers."""
+        super().init_model()
+        from ragen.workers.actor import DataParallelPPOActor as RagenPPOActor
+
+        if self._is_actor:
+            self.actor = RagenPPOActor(
+                config=self.actor.config,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+            )
+        if self._is_ref and hasattr(self, "ref_policy"):
+            self.ref_policy = RagenPPOActor(config=self.ref_policy.config, actor_module=self.ref_module_fsdp)
+        if self._is_actor:
+            assert self.actor.__class__.__module__ == RagenPPOActor.__module__
+        if self._is_ref:
+            assert self.ref_policy.__class__.__module__ == RagenPPOActor.__module__
 
 class RewardModelWorker(VerlRewardModelWorker):
     pass
 
 class CriticWorker(VerlCriticWorker):
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Use the turn-aware critic wrapper after upstream FSDP setup."""
+        super().init_model()
+        from ragen.workers.critic import DataParallelPPOCritic as RagenPPOCritic
+
+        critic_config = self.critic.config
+        self.critic = RagenPPOCritic(
+            config=critic_config,
+            critic_module=self.critic_module,
+            critic_optimizer=self.critic_optimizer,
+        )
+        if self.critic.__class__.__module__ != RagenPPOCritic.__module__:
+            raise RuntimeError("Failed to install RAGEN turn-aware critic wrapper")
+
     def _build_critic_model_optimizer(self, config):
         """Only changed the lora config from verl to fix critic lora error"""
 

@@ -30,6 +30,8 @@ def test_sokoban_render_supports_grid_and_coord():
 
         assert isinstance(grid_obs, str)
         assert isinstance(coord_obs, str)
+        assert grid_env.action_space.n == 4
+        assert getattr(grid_env.action_space, "start", 0) == 1
 
         assert "Board size:" in coord_obs
         assert re.search(r"Walls: \(\d+, \d+\)", coord_obs)

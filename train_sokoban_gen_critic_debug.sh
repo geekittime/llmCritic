@@ -28,7 +28,12 @@ RLVR_PARSE_FAIL_PENALTY=-1.0
 # - gen_critic/train/success_source_fallback 应尽量接近 0
 # - gen_critic/train/label_acc, gen_critic/train/format_rate
 
-wandb login --relogin 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
+# W&B credentials must be supplied out-of-band.  Without a key, keep the
+# run usable by writing an offline log that can be synced later.
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    export WANDB_MODE="${WANDB_MODE:-offline}"
+    echo "WANDB_API_KEY is unset; using W&B offline mode" >&2
+fi
 
 MKL_SERVICE_FORCE_INTEL=1 python train.py --config-name _2_sokoban system.CUDA_VISIBLE_DEVICES=\"1,2,3,4\" trainer.n_gpus_per_node=4 \
     trainer.experiment_name=sokoban-gen-critic-debug $USE_BASE $USE_GEN_CRITIC \
@@ -81,4 +86,3 @@ MKL_SERVICE_FORCE_INTEL=1 python train.py --config-name _2_sokoban system.CUDA_V
     algorithm.gamma=1 \
     algorithm.lam=0.95 \
     trainer.project_name=gen-ppo-new
-

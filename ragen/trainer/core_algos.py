@@ -85,63 +85,89 @@ def compute_turn_gae_advantage_return(
     turn_value_ids: torch.Tensor,
     gamma: float,
     lam: float,
+    normalize_advantages: bool = True,
 ):
-    """Compute turn-level GAE and broadcast to action tokens in each turn."""
+    """Compute GAE over macro actions with one scalar reward per turn.
+
+    ``token_level_rewards`` is kept for DataProto compatibility, but every turn
+    reward must be written exactly once (normally at ``turn_end_mask``).  The
+    resulting scalar advantage is broadcast over the sampled tokens of that
+    turn for the actor, while returns are stored only at value boundaries.
+    """
     with torch.no_grad():
         token_level_rewards = token_level_rewards.float()
         values = values.float()
         response_mask = response_mask.float()
         turn_value_mask = turn_value_mask > 0
-
-        boundary_values = values * turn_value_mask.float()
+        expected_shape = token_level_rewards.shape
+        for name, tensor in {
+            "values": values,
+            "response_mask": response_mask,
+            "turn_ids": turn_ids,
+            "turn_value_mask": turn_value_mask,
+            "turn_value_ids": turn_value_ids,
+        }.items():
+            if tensor.shape != expected_shape:
+                raise ValueError(f"{name} shape {tuple(tensor.shape)} does not match rewards {tuple(expected_shape)}")
 
         advantages = torch.zeros_like(values)
         returns = torch.zeros_like(values)
+        turn_records = []
 
-        batch_size = values.shape[0]
-        for b in range(batch_size):
-            boundary_positions = torch.nonzero(turn_value_mask[b], as_tuple=True)[0]
+        for batch_index in range(values.shape[0]):
+            boundary_positions = torch.nonzero(turn_value_mask[batch_index], as_tuple=True)[0]
             if boundary_positions.numel() == 0:
                 continue
 
-            turn_adv = torch.zeros(boundary_positions.numel(), dtype=values.dtype, device=values.device)
-            turn_ret = torch.zeros_like(turn_adv)
-            turn_rewards = torch.zeros_like(turn_adv)
+            per_episode = []
+            seen_turn_ids = set()
+            for boundary_position in boundary_positions:
+                turn_id = int(turn_value_ids[batch_index, boundary_position].item())
+                if turn_id < 0 or turn_id in seen_turn_ids:
+                    raise ValueError("Each valid turn must have exactly one uniquely identified value boundary")
+                seen_turn_ids.add(turn_id)
+                token_mask = (turn_ids[batch_index] == turn_id) & (response_mask[batch_index] > 0)
+                if not torch.any(token_mask):
+                    raise ValueError(f"Turn {turn_id} has a value boundary but no sampled action tokens")
+                reward = token_level_rewards[batch_index][token_mask].sum()
+                per_episode.append(
+                    {
+                        "batch_index": batch_index,
+                        "turn_id": turn_id,
+                        "boundary_position": boundary_position,
+                        "token_mask": token_mask,
+                        "reward": reward,
+                        "value": values[batch_index, boundary_position],
+                    }
+                )
 
-            for i, pos in enumerate(boundary_positions):
-                tid = turn_value_ids[b, pos]
-                if tid < 0:
-                    continue
-                action_token_mask = (turn_ids[b] == tid) & (response_mask[b] > 0)
-                turn_rewards[i] = token_level_rewards[b][action_token_mask].sum()
+            last_gae = torch.zeros((), dtype=values.dtype, device=values.device)
+            for record_index in range(len(per_episode) - 1, -1, -1):
+                record = per_episode[record_index]
+                next_value = (
+                    per_episode[record_index + 1]["value"]
+                    if record_index + 1 < len(per_episode)
+                    else torch.zeros((), dtype=values.dtype, device=values.device)
+                )
+                delta = record["reward"] + gamma * next_value - record["value"]
+                last_gae = delta + gamma * lam * last_gae
+                record["advantage"] = last_gae
+                record["return"] = last_gae + record["value"]
+            turn_records.extend(per_episode)
 
-            lastgaelam = torch.tensor(0.0, dtype=values.dtype, device=values.device)
-            for i in range(boundary_positions.numel() - 1, -1, -1):
-                pos = boundary_positions[i]
-                reward = turn_rewards[i]
-                value = boundary_values[b, pos]
+        if turn_records:
+            scalar_advantages = torch.stack([record["advantage"] for record in turn_records])
+            if normalize_advantages and scalar_advantages.numel() > 1:
+                scalar_advantages = (scalar_advantages - scalar_advantages.mean()) * torch.rsqrt(
+                    scalar_advantages.var(unbiased=False) + 1e-8
+                )
 
-                if i < boundary_positions.numel() - 1:
-                    next_pos = boundary_positions[i + 1]
-                    next_value = boundary_values[b, next_pos]
-                else:
-                    next_value = torch.tensor(0.0, dtype=values.dtype, device=values.device)
+            for record, scalar_advantage in zip(turn_records, scalar_advantages):
+                batch_index = record["batch_index"]
+                advantages[batch_index, record["token_mask"]] = scalar_advantage
+                returns[batch_index, record["boundary_position"]] = record["return"]
 
-                delta = reward + gamma * next_value - value
-                lastgaelam = delta + gamma * lam * lastgaelam
-                turn_adv[i] = lastgaelam
-                turn_ret[i] = lastgaelam + value
-
-            for i, pos in enumerate(boundary_positions):
-                tid = turn_value_ids[b, pos]
-                if tid < 0:
-                    continue
-                token_mask = (turn_ids[b] == tid) & (response_mask[b] > 0)
-                advantages[b, token_mask] = turn_adv[i]
-                returns[b, token_mask] = turn_ret[i]
-                returns[b, pos] = turn_ret[i]
-
-        advantages = verl_F.masked_whiten(advantages, response_mask)
+        advantages *= response_mask
 
     return advantages, returns
 

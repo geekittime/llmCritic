@@ -6,7 +6,12 @@ USE_GRPO="algorithm.adv_estimator=grpo"
 USE_PPO="algorithm.adv_estimator=gae" # by default.
 USE_BASE="algorithm.kl_ctrl.kl_coef=0.001 actor_rollout_ref.actor.kl_loss_coef=0.001 actor_rollout_ref.actor.clip_ratio_high=0.2 actor_rollout_ref.rollout.rollout_filter_ratio=1"
 
-wandb login --relogin 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
+# W&B credentials must be supplied out-of-band.  Without a key, keep the
+# run usable by writing an offline log that can be synced later.
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    export WANDB_MODE="${WANDB_MODE:-offline}"
+    echo "WANDB_API_KEY is unset; using W&B offline mode" >&2
+fi
 
 # Section 3.1&3.2 - General Observations
 
@@ -23,5 +28,3 @@ MKL_SERVICE_FORCE_INTEL=1 python train.py --config-name _2_sokoban system.CUDA_V
     trainer.test_freq=10 \
     trainer.resume_mode=auto \
     trainer.project_name=gen-ppo-new \
-
-

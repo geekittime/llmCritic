@@ -210,10 +210,19 @@ class EnvStateManager:
             if turn_done:
                 status.terminated = True # TODO check terminated definition in gymnasium
                 status.truncated = not turn_info.get('success', False)
-            history = self._update_cache_history(history, next_state=obs, actions_left=actions_left, num_actions_info={
+            action_record = {
                 'actions': executed_actions, 'reward': acc_reward, 'info': turn_info,
                 'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response']
-            })
+            }
+            for trace_key in ("prompt_token_ids", "response_token_ids"):
+                if trace_key in env_input:
+                    action_record[trace_key] = list(env_input[trace_key])
+            history = self._update_cache_history(
+                history,
+                next_state=obs,
+                actions_left=actions_left,
+                num_actions_info=action_record,
+            )
             # filter out invalid actions
             # history = [content for content in history[:-1] if content['actions']] + [history[-1]]
             return status, history
@@ -331,7 +340,10 @@ class EnvStateManager:
             for k, v in custom_metric.items():
                 # TODO: Move TURN_LVL_METRICS into the environment
                 if "webshop" not in cache['tag'].lower() or ("webshop" in cache['tag'].lower() and k in TURN_LVL_METRICS):
-                    env_metric[k] = np.sum(v) / (len(cache['history']) - 1) # NOTE: exclude the last observation
+                    # History always contains an initial state, but keep the
+                    # denominator non-zero for a defensive empty/failed
+                    # rollout.
+                    env_metric[k] = np.sum(v) / max(len(cache['history']) - 1, 1) # NOTE: exclude the last observation
                 else:
                     env_metric['traj_sum/' + k] = np.sum(v)
             try:
@@ -340,7 +352,8 @@ class EnvStateManager:
             except Exception:
                 pass
 
-            cache['history'][-1]['metrics'] = custom_metric
+            if cache['history']:
+                cache['history'][-1]['metrics'] = custom_metric
             env_metric = {f"{entry['tag']}/{k}": v for k, v in env_metric.items()}
             cache['metrics'] = env_metric
             if entry['tag'] == "MetamathQA":

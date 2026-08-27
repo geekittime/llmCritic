@@ -17,7 +17,12 @@ CRITIC_TEMPERATURE=0.3
 CRITIC_TOP_P=1.0
 CRITIC_TOP_K=-1
 
-wandb login --relogin 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
+# W&B credentials must be supplied out-of-band.  Without a key, keep the
+# run usable by writing an offline log that can be synced later.
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    export WANDB_MODE="${WANDB_MODE:-offline}"
+    echo "WANDB_API_KEY is unset; using W&B offline mode" >&2
+fi
 
 MKL_SERVICE_FORCE_INTEL=1 python train.py --config-name _3_frozen_lake system.CUDA_VISIBLE_DEVICES=\"0,5,6,7\" trainer.n_gpus_per_node=4 \
     trainer.experiment_name=sokoban-gen-critic-debug $USE_BASE $USE_GEN_CRITIC \

@@ -33,6 +33,144 @@ def get_special_tokens(tokenizer: AutoTokenizer):
         raise ValueError(f"Unsupported model: {tokenizer.name_or_path}")
     return special_token, reward_token
 
+
+def build_turn_token_metadata(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: List[int],
+    response_lengths: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build causal-LM-aligned metadata for exact prompt/response traces.
+
+    The returned tensors are aligned with causal-LM log probabilities: index
+    ``j`` describes target token ``input_ids[j + 1]``.  Chat-template role
+    tokens and fixed generation prefixes are already part of ``prompt_lengths``;
+    only the original sampled response tokens form turn actions.
+    """
+    if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+        raise ValueError("input_ids and attention_mask must be rank-2 tensors with identical shapes")
+    if len(prompt_lengths) != input_ids.shape[0] or len(response_lengths) != input_ids.shape[0]:
+        raise ValueError("prompt_lengths and response_lengths must match the batch size")
+
+    batch_size, sequence_length = input_ids.shape
+    target_length = sequence_length - 1
+    turn_ids = torch.full((batch_size, target_length), -1, dtype=torch.long, device=input_ids.device)
+    turn_value_mask = torch.zeros((batch_size, target_length), dtype=torch.float32, device=input_ids.device)
+    turn_value_ids = torch.full_like(turn_ids, -1)
+    turn_end_mask = torch.zeros_like(turn_value_mask)
+    for batch_index, (prompt_length, response_length) in enumerate(zip(prompt_lengths, response_lengths)):
+        prompt_length = int(prompt_length)
+        response_length = int(response_length)
+        valid_length = int(attention_mask[batch_index].sum().item())
+        if valid_length < 0 or valid_length > sequence_length:
+            raise ValueError("attention_mask contains an invalid number of valid tokens")
+        padding_length = sequence_length - valid_length
+        expected_attention = torch.zeros(sequence_length, dtype=torch.bool, device=input_ids.device)
+        expected_attention[padding_length:] = True
+        if not torch.equal(attention_mask[batch_index].bool(), expected_attention):
+            raise ValueError("Exact token traces require contiguous left padding followed by valid tokens")
+        if prompt_length + response_length != valid_length:
+            raise ValueError("Each exact trace must contain prompt_length + response_length valid tokens")
+        if response_length <= 0:
+            continue
+
+        # Response target positions are [padding + prompt, valid sequence end).
+        # Their log probabilities are stored one index to the left.
+        action_start = padding_length + prompt_length - 1
+        action_end = action_start + response_length
+        if action_start < 0 or action_end > target_length:
+            raise ValueError("Invalid sampled response span after causal-LM alignment")
+
+        turn_ids[batch_index, action_start:action_end] = 0
+        turn_value_mask[batch_index, action_start] = 1.0
+        turn_value_ids[batch_index, action_start] = 0
+        turn_end_mask[batch_index, action_end - 1] = 1.0
+
+    return turn_ids, turn_value_mask, turn_value_ids, turn_end_mask
+
+
+def build_legacy_turn_metadata(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    tokenizer: AutoTokenizer,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Best-effort metadata for old rollouts that did not retain token traces.
+
+    This path cannot guarantee behavior-policy identity (the text may have
+    been re-tokenized), but it can still avoid treating chat-template role
+    headers as sampled actions.  We scan each assistant segment and convert
+    *target* token positions to causal-logit source positions explicitly.
+    """
+    start_token, reward_token = get_special_tokens(tokenizer)
+    batch_size, sequence_length = input_ids.shape
+    target_length = sequence_length - 1
+    turn_ids = torch.full((batch_size, target_length), -1, dtype=torch.long, device=input_ids.device)
+    turn_value_mask = torch.zeros_like(turn_ids, dtype=torch.float32)
+    turn_value_ids = torch.full_like(turn_ids, -1)
+    turn_end_mask = torch.zeros_like(turn_value_mask)
+
+    for batch_index in range(batch_size):
+        valid_positions = torch.nonzero(attention_mask[batch_index].bool(), as_tuple=True)[0]
+        if valid_positions.numel() < 2:
+            continue
+        valid_start = int(valid_positions[0].item())
+        valid_end = int(valid_positions[-1].item())
+        starts = torch.nonzero(
+            (input_ids[batch_index] == start_token) & attention_mask[batch_index].bool(),
+            as_tuple=True,
+        )[0].tolist()
+        turn_number = 0
+        for start_position in starts:
+            if start_position >= valid_end:
+                continue
+            # Find the role terminator for this chat-template segment.  If a
+            # malformed sample has no terminator, use the end of its valid
+            # sequence and keep the remaining tokens as the assistant span.
+            end_candidates = torch.nonzero(
+                (input_ids[batch_index] == reward_token)
+                & attention_mask[batch_index].bool()
+                & (torch.arange(sequence_length, device=input_ids.device) > start_position),
+                as_tuple=True,
+            )[0]
+            end_position = int(end_candidates[0].item()) if end_candidates.numel() else valid_end
+
+            header_ids = input_ids[batch_index, start_position + 1 : end_position].tolist()
+            header_text = tokenizer.decode(header_ids, skip_special_tokens=True).strip().lower()
+            if not header_text.startswith("assistant"):
+                continue
+
+            # Skip the role name and its line break.  Decoding one token at a
+            # time is intentionally limited to the short role header.
+            content_start = start_position + 1
+            while content_start < end_position:
+                token_text = tokenizer.decode(
+                    [int(input_ids[batch_index, content_start].item())],
+                    skip_special_tokens=True,
+                )
+                if token_text.strip() == "assistant":
+                    content_start += 1
+                    continue
+                if token_text in {"", "\n", "\r", "\r\n"}:
+                    content_start += 1
+                    continue
+                break
+
+            # Target positions include the response terminator when present;
+            # causal log-probability index is one position to its left.
+            target_end = min(end_position, valid_end)
+            source_start = max(valid_start, content_start - 1)
+            source_end = min(target_length, target_end)
+            if source_start >= source_end:
+                continue
+            turn_ids[batch_index, source_start:source_end] = turn_number
+            turn_value_mask[batch_index, source_start] = 1.0
+            turn_value_ids[batch_index, source_start] = turn_number
+            turn_end_mask[batch_index, source_end - 1] = 1.0
+            turn_number += 1
+
+    return turn_ids, turn_value_mask, turn_value_ids, turn_end_mask
+
+
 def get_masks_and_scores(input_ids: torch.Tensor, tokenizer: AutoTokenizer, all_scores: List[List[float]] = None, use_turn_scores: bool = False, enable_response_mask: bool = False):
     """
     input_ids: shape (bsz, seq_len)
@@ -58,15 +196,14 @@ def get_masks_and_scores(input_ids: torch.Tensor, tokenizer: AutoTokenizer, all_
             # Set the last token of the rows where all positions are False to True
             reward_position[~reward_position.any(dim=-1), -1] = True
             score_tensor[reward_position] = scores
-        if "qwen" in tokenizer.name_or_path.lower():
-            # for Qwen, there is a "\n" between special token and reward token, so we shift this to make sure reward is assigned to the last token of a turn
-            score_tensor = score_tensor.roll(shifts=1, dims=-1)
     else:
         scores = [sum(i) for i in all_scores]
         score_tensor[:, -1] = torch.tensor(scores, dtype=torch.float32)
     score_tensor = score_tensor[:, 1:] # remove the first token
-    loss_mask = loss_mask[:, :-1].float() # remove the last token
-    response_mask = response_mask[:, :-1].float() # remove the last token
+    # logits[:, j] predicts input_ids[:, j + 1], so masks must be aligned to
+    # destination tokens rather than the source-token positions.
+    loss_mask = loss_mask[:, 1:].float()
+    response_mask = response_mask[:, 1:].float()
 
     return score_tensor, loss_mask, response_mask
 
@@ -940,11 +1077,174 @@ class ContextManager:
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
         return llm_inputs
 
+    @staticmethod
+    def _has_complete_token_traces(env_outputs: List[Dict]) -> bool:
+        action_turns = [
+            turn
+            for env_output in env_outputs
+            for turn in env_output.get("history", [])
+            if "llm_response" in turn
+        ]
+        return bool(action_turns) and all(
+            "prompt_token_ids" in turn and "response_token_ids" in turn
+            for turn in action_turns
+        )
+
+    def _build_samples_from_token_traces(self, env_outputs: List[Dict]) -> DataProto:
+        """Build one exact behavior-policy sequence per sampled macro action."""
+        token_sequences: List[List[int]] = []
+        prompt_lengths: List[int] = []
+        response_lengths: List[int] = []
+        messages_list: List[List[Dict[str, str]]] = []
+        env_ids: List[int] = []
+        group_ids: List[int] = []
+        episode_ids: List[int] = []
+        trajectory_turn_ids: List[int] = []
+        trajectory_success: List[float] = []
+        endpoint_rewards: List[float] = []
+
+        for episode_index, env_output in enumerate(env_outputs):
+            full_history = env_output.get("history", [])
+            action_turn_positions = [
+                index for index, history_turn in enumerate(full_history) if "llm_response" in history_turn
+            ]
+            nonempty_action_positions = [
+                index
+                for index in action_turn_positions
+                if full_history[index].get("prompt_token_ids") and full_history[index].get("response_token_ids")
+            ]
+            success = float(
+                env_output.get("metrics", {}).get(f"{env_output.get('tag', '')}/success", 0.0)
+            )
+            for turn_index, turn in enumerate(full_history):
+                if "llm_response" not in turn:
+                    continue
+                action_turn_index = sum(
+                    1 for previous_turn in full_history[:turn_index] if "llm_response" in previous_turn
+                )
+                prompt_ids = list(turn["prompt_token_ids"])
+                response_ids = list(turn["response_token_ids"])
+                if not prompt_ids or not response_ids:
+                    logging.warning(
+                        "Skipping empty token trace for env=%s turn=%s",
+                        env_output.get("env_id"),
+                        turn_index,
+                    )
+                    continue
+
+                token_sequences.append(prompt_ids + response_ids)
+                prompt_lengths.append(len(prompt_ids))
+                response_lengths.append(len(response_ids))
+                env_ids.append(env_output["env_id"])
+                group_ids.append(env_output["group_id"])
+                episode_ids.append(episode_index)
+                trajectory_turn_ids.append(action_turn_index)
+                trajectory_success.append(success)
+                endpoint_rewards.append(
+                    float(turn.get("reward", 0.0))
+                    if self.config.agent_proxy.use_turn_scores
+                    else (
+                        (1.0 if success > 0.5 else -1.0)
+                        if nonempty_action_positions and turn_index == nonempty_action_positions[-1]
+                        else 0.0
+                    )
+                )
+
+                before_content = self._build_turn_state_content(
+                    turn,
+                    action_turn_index + 1,
+                    env_output["env_id"],
+                )
+                transition_messages = [
+                    {"role": "system", "content": self._build_system_content(env_output["env_id"])},
+                    {"role": "user", "content": before_content},
+                    {
+                        "role": "assistant",
+                        "content": turn.get("llm_raw_response", turn["llm_response"]),
+                    },
+                ]
+                after_content = f"Reward:\n{turn.get('reward', 0.0)}\n"
+                if turn_index + 1 < len(full_history) and "state" in full_history[turn_index + 1]:
+                    after_content += self._build_turn_state_content(
+                        full_history[turn_index + 1],
+                        action_turn_index + 2,
+                        env_output["env_id"],
+                    )
+                transition_messages.append({"role": "user", "content": after_content})
+                messages_list.append(transition_messages)
+
+        if not token_sequences:
+            raise ValueError("No non-empty sampled token traces were found in the rollout batch")
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        max_length = max(len(sequence) for sequence in token_sequences)
+        input_ids = torch.full((len(token_sequences), max_length), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids)
+        for index, sequence in enumerate(token_sequences):
+            sequence_tensor = torch.tensor(sequence, dtype=torch.long)
+            input_ids[index, -len(sequence) :] = sequence_tensor
+            attention_mask[index, -len(sequence) :] = 1
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+
+        turn_ids, turn_value_mask, turn_value_ids, turn_end_mask = build_turn_token_metadata(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_lengths=prompt_lengths,
+            response_lengths=response_lengths,
+        )
+        response_mask = (turn_ids >= 0).float()
+        score_tensor = torch.zeros_like(response_mask)
+        for index, reward in enumerate(endpoint_rewards):
+            endpoint = torch.nonzero(turn_end_mask[index] > 0, as_tuple=True)[0]
+            if endpoint.numel() > 0:
+                score_tensor[index, endpoint[-1]] = reward
+
+        llm_inputs = DataProto()
+        llm_inputs.batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": input_ids[:, 1:],
+                "loss_mask": response_mask,
+                "rm_scores": score_tensor,
+                "original_rm_scores": score_tensor.clone(),
+                "turn_ids": turn_ids,
+                "turn_value_mask": turn_value_mask,
+                "turn_value_ids": turn_value_ids,
+                "turn_end_mask": turn_end_mask,
+            },
+            batch_size=input_ids.shape[0],
+        )
+        llm_inputs.non_tensor_batch = {
+            "env_ids": np.asarray(env_ids, dtype=int),
+            "group_ids": np.asarray(group_ids, dtype=int),
+            "messages_list": np.asarray(messages_list, dtype=object),
+            "episode_ids": np.asarray(episode_ids, dtype=int),
+            "trajectory_turn_ids": np.asarray(trajectory_turn_ids, dtype=int),
+            "trajectory_success": np.asarray(trajectory_success, dtype=np.float32),
+        }
+        response_length = float(np.mean(response_lengths))
+        llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
+        return llm_inputs
+
     def _build_samples_full(self, env_outputs: List[Dict]) -> DataProto:
         """
         Build full multi-turn samples for update (original behavior).
         All assistant turns are trained.
         """
+        if self._has_complete_token_traces(env_outputs):
+            return self._build_samples_from_token_traces(env_outputs)
+
+        if not bool(getattr(self.config.agent_proxy, "allow_legacy_retokenization", False)):
+            raise RuntimeError(
+                "Rollout batch has no original prompt/response token traces. "
+                "Turn PPO refuses to recompute probabilities from decoded text because tokenization may differ; "
+                "regenerate the rollouts or explicitly set agent_proxy.allow_legacy_retokenization=true."
+            )
+        logging.warning("Using explicitly enabled legacy text re-tokenization for an old rollout batch")
         llm_input_texts = []
         messages_list = []
 
@@ -962,7 +1262,11 @@ class ContextManager:
                         content, actual_turn, env_output["env_id"]
                     )
                 if "llm_response" in content:
-                    messages.append({"role": "assistant", "content": content["llm_response"]})
+                    # Train on the model's emitted text.  The parsed response may
+                    # truncate invalid or extra actions and is not the behavior
+                    # policy action whose probability PPO must recompute.
+                    assistant_content = content.get("llm_raw_response", content["llm_response"])
+                    messages.append({"role": "assistant", "content": assistant_content})
                 if "reward" in content and idx < len(history) - 1:
                     messages.append({"role": "user", "content": f"Reward:\n{content['reward']}\n"})
 
@@ -989,41 +1293,15 @@ class ContextManager:
             enable_response_mask=self.config.enable_response_mask
         )
 
-        # Build turn-level indexing tensors for turn-PPO style training.
-        # turn_ids: assistant action tokens -> turn index, else -1
-        # turn_value_mask: only one boundary token per turn (query/env end token)
-        # turn_value_ids: turn index at boundary tokens, else -1
-        special_token, _ = get_special_tokens(self.tokenizer)
-        turn_starts = torch.where(input_ids == special_token, 1, 0)
-        turn_indicators = torch.cumsum(turn_starts, dim=-1)
-        assistant_mask = (turn_indicators % 2 == 1) & (turn_indicators > 1)
-
-        turn_ids = torch.full_like(loss_mask, -1, dtype=torch.long)
-        assistant_turn_ids = ((turn_indicators - 3) // 2).to(torch.long)
-        turn_ids = torch.where(assistant_mask[:, :-1], assistant_turn_ids[:, :-1], turn_ids)
-
-        turn_value_mask = torch.zeros_like(loss_mask, dtype=torch.float32)
-        turn_value_ids = torch.full_like(loss_mask, -1, dtype=torch.long)
-        for b in range(input_ids.shape[0]):
-            assistant_positions = torch.nonzero(assistant_mask[b], as_tuple=True)[0]
-            if assistant_positions.numel() == 0:
-                continue
-
-            # assistant turn starts are the first token of each assistant segment
-            starts = [assistant_positions[0].item()]
-            prev_pos = assistant_positions[0].item()
-            for pos in assistant_positions[1:]:
-                pos = pos.item()
-                if pos != prev_pos + 1:
-                    starts.append(pos)
-                prev_pos = pos
-
-            for end_pos in starts:
-                boundary_pos = end_pos - 1
-                if boundary_pos < 0 or boundary_pos >= turn_value_mask.shape[1]:
-                    continue
-                turn_value_mask[b, boundary_pos] = 1.0
-                turn_value_ids[b, boundary_pos] = assistant_turn_ids[b, end_pos]
+        turn_ids, turn_value_mask, turn_value_ids, turn_end_mask = build_legacy_turn_metadata(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            tokenizer=self.tokenizer,
+        )
+        # Turn PPO only optimizes tokens actually sampled by the actor.  This
+        # also prevents template/user tokens from leaking into entropy and KL.
+        response_mask = (turn_ids >= 0).float()
+        loss_mask = response_mask.clone()
 
         if getattr(self.config.agent_proxy, "debug_turn_boundary", False):
             max_samples = min(input_ids.shape[0], 2)
@@ -1031,13 +1309,7 @@ class ContextManager:
             for b in range(max_samples):
                 ids = input_ids[b].tolist()
                 boundary_positions = torch.nonzero(turn_value_mask[b] > 0, as_tuple=True)[0].tolist()
-                assistant_positions = torch.nonzero(assistant_mask[b], as_tuple=True)[0].tolist()
-                assistant_starts = []
-                prev_pos = None
-                for pos in assistant_positions:
-                    if prev_pos is None or pos != prev_pos + 1:
-                        assistant_starts.append(pos)
-                    prev_pos = pos
+                assistant_starts = torch.nonzero(turn_value_mask[b] > 0, as_tuple=True)[0].tolist()
 
                 print(f"sample={b} assistant_starts={assistant_starts}")
                 print(f"sample={b} boundary_positions={boundary_positions}")
@@ -1065,6 +1337,12 @@ class ContextManager:
         # Normalize scores
         if not self.config.agent_proxy.use_turn_scores:
             score_tensor = self._normalize_score_tensor(score_tensor, env_outputs)
+            trajectory_scores = score_tensor[:, -1].clone()
+            score_tensor.zero_()
+            for batch_index in range(score_tensor.shape[0]):
+                endpoints = torch.nonzero(turn_end_mask[batch_index] > 0, as_tuple=True)[0]
+                if endpoints.numel() > 0:
+                    score_tensor[batch_index, endpoints[-1]] = trajectory_scores[batch_index]
 
         response_length = response_mask.sum(dim=-1).float().mean().item()
 
@@ -1081,6 +1359,7 @@ class ContextManager:
             "turn_ids": turn_ids,
             "turn_value_mask": turn_value_mask,
             "turn_value_ids": turn_value_ids,
+            "turn_end_mask": turn_end_mask,
         }, batch_size=input_ids.shape[0])
 
         llm_inputs.non_tensor_batch = {
@@ -1246,25 +1525,82 @@ class ContextManager:
             return self._build_infer_samples(env_outputs)
 
     def get_env_inputs(self, lm_outputs: DataProto) -> List[Dict]:
+        prompt_token_ids = None
+        response_token_ids = None
         if lm_outputs.batch is not None and 'responses' in lm_outputs.batch.keys():
             responses = self.tokenizer.batch_decode(
                 lm_outputs.batch['responses'], 
                 skip_special_tokens=True
             )
+
+            response_tensor = lm_outputs.batch["responses"]
+            response_length = response_tensor.shape[1]
+            if "prompts" in lm_outputs.batch:
+                prompt_tensor = lm_outputs.batch["prompts"]
+            elif "sequences" in lm_outputs.batch:
+                # NaiveRollout keeps the prompt-only tensor under ``input_ids``
+                # and exposes the concatenated sequence as ``sequences``.
+                sequence_tensor = lm_outputs.batch["sequences"]
+                if sequence_tensor.shape[1] < response_length:
+                    raise ValueError("Rollout sequence is shorter than its response tensor")
+                prompt_tensor = sequence_tensor[:, : sequence_tensor.shape[1] - response_length]
+            else:
+                input_tensor = lm_outputs.batch["input_ids"]
+                # vLLM/HF store the complete sequence in input_ids, whereas
+                # older NaiveRollout stores only the prompt.  Use attention-mask
+                # length to distinguish those layouts without guessing from
+                # token values (which may legitimately equal pad_token_id).
+                if response_length == 0:
+                    prompt_tensor = input_tensor
+                elif "attention_mask" in lm_outputs.batch and input_tensor.shape[1] != lm_outputs.batch["attention_mask"].shape[1]:
+                    prompt_tensor = input_tensor
+                elif input_tensor.shape[1] < response_length:
+                    prompt_tensor = input_tensor
+                else:
+                    prompt_tensor = input_tensor[:, : input_tensor.shape[1] - response_length]
+
+            if "attention_mask" in lm_outputs.batch:
+                full_attention_mask = lm_outputs.batch["attention_mask"]
+                prompt_attention_mask = full_attention_mask[:, : prompt_tensor.shape[1]]
+                response_attention_mask = (
+                    full_attention_mask[:, -response_length:]
+                    if response_length > 0
+                    else full_attention_mask[:, :0]
+                )
+            else:
+                prompt_attention_mask = torch.ones_like(prompt_tensor)
+                pad_token_id = self.tokenizer.pad_token_id
+                if response_length == 0:
+                    response_attention_mask = torch.zeros_like(response_tensor)
+                else:
+                    response_attention_mask = (response_tensor != pad_token_id).to(response_tensor.dtype)
+
+            prompt_token_ids = [
+                prompt_tensor[index][prompt_attention_mask[index].bool()].detach().cpu().tolist()
+                for index in range(prompt_tensor.shape[0])
+            ]
+            response_token_ids = [
+                response_tensor[index][response_attention_mask[index].bool()].detach().cpu().tolist()
+                for index in range(response_tensor.shape[0])
+            ]
         else: # dataproto has textual responses
             responses = lm_outputs.non_tensor_batch['response_texts']
         responses = ["<think>" + response if self.config.agent_proxy.enable_think else "<answer>" + response for response in responses] # The LLM generation does not include <think> tags. Add them back here.
             
         env_ids = lm_outputs.non_tensor_batch['env_ids']
         env_inputs = []
-        for env_id, response in zip(env_ids, responses):
+        for output_index, (env_id, response) in enumerate(zip(env_ids, responses)):
             llm_response, actions = self._parse_response(response)
-            env_inputs.append({
+            env_input = {
                 "env_id": env_id,
                 "llm_raw_response": response,
                 "llm_response": llm_response,
                 "actions": actions,
-            })
+            }
+            if prompt_token_ids is not None and response_token_ids is not None:
+                env_input["prompt_token_ids"] = prompt_token_ids[output_index]
+                env_input["response_token_ids"] = response_token_ids[output_index]
+            env_inputs.append(env_input)
         return env_inputs
 
     def formulate_rollouts(self, env_outputs: List[Dict]) -> DataProto:

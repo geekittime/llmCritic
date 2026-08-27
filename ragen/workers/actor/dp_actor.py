@@ -55,6 +55,11 @@ def compute_turn_policy_loss(
     cliprange_high: float,
     clip_ratio_c: float,
 ):
+    if old_log_prob.shape != log_prob.shape or old_log_prob.shape != response_mask.shape:
+        raise ValueError("old_log_prob, log_prob, and response_mask must have identical shapes")
+    if turn_ids.shape != response_mask.shape or advantages.shape != response_mask.shape:
+        raise ValueError("turn_ids and advantages must be aligned with response_mask")
+
     turn_old_log_prob = []
     turn_log_prob = []
     turn_advantages = []
@@ -67,7 +72,10 @@ def compute_turn_policy_loss(
                 continue
 
             token_indices = torch.nonzero(token_mask, as_tuple=True)[0]
-            turn_advantage = advantages[b, token_indices[0]]
+            # Advantages may be stored only at the turn endpoint (the scalar
+            # reward convention); use the last sampled token so both endpoint
+            # and broadcast GAE representations are supported.
+            turn_advantage = advantages[b, token_indices[-1]]
             turn_old_log_prob.append(old_log_prob[b][token_mask].sum())
             turn_log_prob.append(log_prob[b][token_mask].sum())
             turn_advantages.append(turn_advantage)
@@ -231,6 +239,12 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.step()
         return grad_norm
 
+    @staticmethod
+    def _count_turns(turn_ids: torch.Tensor) -> int:
+        if turn_ids.numel() == 0:
+            return 0
+        return sum(int(torch.unique(row[row >= 0]).numel()) for row in turn_ids)
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False, no_lora=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -352,6 +366,16 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                mini_batch_turn_count = None
+                mini_batch_turn_ids = (
+                    mini_batch.batch.get("turn_ids")
+                    if isinstance(mini_batch, DataProto)
+                    else mini_batch.get("turn_ids")
+                )
+                if mini_batch_turn_ids is not None:
+                    mini_batch_turn_count = self._count_turns(mini_batch_turn_ids)
+                    if mini_batch_turn_count <= 0:
+                        raise ValueError("Turn PPO received a mini-batch without any valid turn actions")
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -426,7 +450,18 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        if turn_ids is not None and mini_batch_turn_count is not None:
+                            micro_turn_count = self._count_turns(turn_ids)
+                            loss = policy_loss * (micro_turn_count / mini_batch_turn_count)
+                        else:
+                            loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                    elif turn_ids is not None and mini_batch_turn_count is not None:
+                        # compute_turn_policy_loss is a mean over turns. Scale
+                        # each micro-batch by its turn count so gradient
+                        # accumulation is a true mean over macro actions,
+                        # rather than a mean over micro-batches.
+                        micro_turn_count = self._count_turns(turn_ids)
+                        loss = policy_loss * (micro_turn_count / mini_batch_turn_count)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
