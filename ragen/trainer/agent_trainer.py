@@ -54,7 +54,7 @@ from verl.utils.torch_functional import masked_mean
 from transformers import AutoTokenizer
 
 from ragen.llm_agent.agent_proxy import LLMAgentProxy
-from ragen.utils import GenerationsLogger
+from ragen.utils import GenerationsLogger, redact_config
 from ragen.trainer.rollout_filter import build_rollout_filter
 from ragen.trainer.generative_critic import FrozenGenerativeCritic
 
@@ -1355,7 +1355,9 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+            # Keep credentials out of W&B metadata even when supplied through
+            # an ad-hoc Hydra override instead of the recommended env var.
+            config=redact_config(OmegaConf.to_container(self.config, resolve=True)),
         )
 
         self.global_steps = 0

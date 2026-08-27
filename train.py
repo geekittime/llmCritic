@@ -15,40 +15,12 @@ from ragen.utils import register_resolvers
 register_resolvers()
 import sys
 import socket
-import re
-from collections.abc import Mapping
+from ragen.utils import redact_config
 
 
-_SECRET_CONFIG_KEY = re.compile(
-    r"(?:api[_-]?key|access[_-]?token|auth(?:orization)?|token|secret|password|credential)",
-    re.IGNORECASE,
-)
-
-
-def _redact_config(value, key_name: str = ""):
-    """Return a log-safe copy of a Hydra config without mutating it.
-
-    The trainer prints the resolved config from both the driver and a Ray
-    worker.  Redacting by key keeps an accidentally supplied API credential
-    out of those logs while preserving useful run diagnostics.  Launchers
-    should still keep secrets out of Hydra overrides because Hydra may persist
-    those overrides in its run directory.
-    """
-    from omegaconf import DictConfig, ListConfig, OmegaConf
-
-    if _SECRET_CONFIG_KEY.search(key_name):
-        if value is None or value == "":
-            return value
-        return "<redacted>"
-    if isinstance(value, DictConfig):
-        value = OmegaConf.to_container(value, resolve=True)
-    elif isinstance(value, ListConfig):
-        value = OmegaConf.to_container(value, resolve=True)
-    if isinstance(value, Mapping):
-        return {str(key): _redact_config(item, str(key)) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_redact_config(item, key_name) for item in value]
-    return value
+# Keep the private name used by the existing launcher/tests while sharing the
+# implementation with the trainer's W&B configuration sanitization.
+_redact_config = redact_config
 
 class DummyRewardManager():
     """The reward manager.

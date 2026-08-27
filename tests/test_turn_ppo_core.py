@@ -14,6 +14,26 @@ from ragen.trainer.agent_trainer import (
 from ragen.trainer.core_algos import compute_turn_gae_advantage_return
 from ragen.workers.actor.dp_actor import compute_turn_policy_loss
 from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+from ragen.utils import redact_config
+
+
+def test_tracker_config_redacts_nested_credentials_without_mutating_input():
+    config = {
+        "generative_critic": {
+            "deepseek_api_key": "sk-not-for-logs",
+            "deepseek_api_key_env": "DEEPSEEK_API_KEY",
+            "max_concurrency": 8,
+        },
+        "wandb_token": "wb-not-for-logs",
+    }
+
+    redacted = redact_config(config)
+
+    assert redacted["generative_critic"]["deepseek_api_key"] == "<redacted>"
+    assert redacted["generative_critic"]["deepseek_api_key_env"] == "<redacted>"
+    assert redacted["wandb_token"] == "<redacted>"
+    assert redacted["generative_critic"]["max_concurrency"] == 8
+    assert config["generative_critic"]["deepseek_api_key"] == "sk-not-for-logs"
 
 
 def test_token_trace_metadata_is_causal_aligned_and_left_padding_safe():

@@ -3,6 +3,36 @@ import numpy as np
 from contextlib import contextmanager
 from omegaconf import OmegaConf
 import dataclasses
+import re
+from collections.abc import Mapping
+
+
+_SECRET_CONFIG_KEY = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|auth(?:orization)?|token|secret|password|credential)",
+    re.IGNORECASE,
+)
+
+
+def redact_config(value, key_name: str = ""):
+    """Return a log-safe copy of a Hydra config.
+
+    Credentials should normally be supplied through the environment, but this
+    helper also protects tracker/console logs when a user accidentally places
+    one in a config override.  The input is never mutated.
+    """
+    from omegaconf import DictConfig, ListConfig
+
+    if _SECRET_CONFIG_KEY.search(key_name):
+        if value is None or (isinstance(value, str) and value == ""):
+            return value
+        return "<redacted>"
+    if isinstance(value, (DictConfig, ListConfig)):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, Mapping):
+        return {str(key): redact_config(item, str(key)) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_config(item, key_name) for item in value]
+    return value
 
 @contextmanager
 def all_seed(seed):
