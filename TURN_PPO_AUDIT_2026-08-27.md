@@ -201,8 +201,9 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 | `61f56ca` | 切换到官方当前 `deepseek-v4-flash`，显式关闭 thinking，并将模式纳入请求缓存键 |
 | `c36ab18` | 更新 Flash 模型验证记录 |
 | `c8477b0` | 统一 console/W&B tracker 配置脱敏，新增凭据不落日志回归测试 |
+| `59ce033` | 在系统/turn 提示中区分轨迹动作预算与单 turn 动作上限 |
 
-当前分支为 `feature/turn-ppo-deepseek-progress`，已推送到 `github.com/geekittime/llmCritic`，远端与本地均指向 `c8477b0`。实现提交没有把 DeepSeek 或 W&B 凭据写入 YAML、shell 参数或日志；Ray 启动时只转发进程环境中已经存在的对应变量。
+当前分支为 `feature/turn-ppo-deepseek-progress`，已推送到 `github.com/geekittime/llmCritic`，远端与本地均指向最新实现提交。实现提交没有把 DeepSeek 或 W&B 凭据写入 YAML、shell 参数或日志；Ray 启动时只转发进程环境中已经存在的对应变量。
 
 ### 已实现的训练路径
 
@@ -221,6 +222,7 @@ raw product 是 exact macro likelihood，但长 turn 的 `sum(log-ratio)` 很快
 - 在 `61f56ca` 后再次用 `deepseek-v4-flash` 预检返回码 0；解析到 `deepseek_model: deepseek-v4-flash`、`deepseek_thinking: disabled` 和 `parse_fail_score: -1`。日志：`/tmp/llmcritic-dryrun-v4-20260828.log`。
 - 无密钥启动预检在模型/Ray 初始化前返回码 1，并明确提示 `DEEPSEEK_API_KEY` 缺失。日志：`/tmp/llmcritic-script-no-key-20260828.log`。
 - 最新无密钥启动预检返回码仍为 1；带占位 key 的 `DRY_RUN=1` 返回码为 0，并解析出 `deepseek_model: deepseek-v4-flash`、`deepseek_thinking: disabled`、`parse_fail_score: -1`。日志：`/tmp/llmcritic-script-no-key-final-20260828.log`、`/tmp/llmcritic-dryrun-final-20260828.log`。
+- `59ce033` 后重新跑的聚焦测试仍为 `33 passed`；提示词现在同时声明 trajectory budget 与 per-turn action limit，减少被执行列表截断的额外动作。
 - 全量 pytest 仍会在收集阶段受服务器缺失可选依赖、重复外部测试包等环境问题阻塞；这不等同于本实现的断言失败，详见上面的历史测试状态。
 
 ### 正式训练状态
