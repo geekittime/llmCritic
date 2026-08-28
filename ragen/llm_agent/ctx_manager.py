@@ -269,7 +269,16 @@ class ContextManager:
                 env_instruction += coord_hint
             if env_config_new.get("action_lookup", False):
                 action_lookup_str = "\nYour available actions are:\n" + ", ".join([f"{v}" for k, v in env_config_new["action_lookup"].items()])
-                action_lookup_str += f"\nYou can make up to {env_config_new['max_actions_per_traj']} actions, separated by the action separator \" " + self.action_sep + " \"\n"
+                trajectory_action_limit = int(env_config_new["max_actions_per_traj"])
+                turn_action_limit = getattr(self.config.agent_proxy, "max_actions_per_turn", None)
+                if turn_action_limit is None:
+                    turn_action_limit = trajectory_action_limit
+                turn_action_limit = max(1, int(turn_action_limit))
+                action_lookup_str += (
+                    f"\nThe whole trajectory may contain at most {trajectory_action_limit} primitive actions. "
+                    f"In each assistant turn, output at most {turn_action_limit} action(s), separated by \" "
+                    f"{self.action_sep} \"; do not add extra actions.\n"
+                )
                 env_instruction += action_lookup_str
             prefixes[env_tag] = env_instruction
             env_config_lookup[env_tag] = {'max_tokens': env_config.get("max_tokens", self.config.actor_rollout_ref.rollout.response_length)}
@@ -639,7 +648,12 @@ class ContextManager:
             if self.config.agent_proxy.enable_think
             else "<answer> [your answer] </answer>"
         )
-        LENGTH_PROMPT = f"Max response length: {self.env_config_lookup[env_id]['max_tokens']} words (tokens)."
+        turn_action_limit = getattr(self.config.agent_proxy, "max_actions_per_turn", 1)
+        turn_action_limit = max(1, int(turn_action_limit))
+        LENGTH_PROMPT = (
+            f"Max response length: {self.env_config_lookup[env_id]['max_tokens']} words (tokens). "
+            f"Inside <answer>, output at most {turn_action_limit} action(s) for this turn; do not add extra actions."
+        )
         return FORMAT_PROMPT, LENGTH_PROMPT
 
     def _build_system_content(self, env_id: int) -> str:
@@ -856,8 +870,7 @@ class ContextManager:
 
         actual_turn = turn_idx + 1 + turn_offset
         current_turn_prefix = "Current Turn " if history_start < turn_idx else ""
-        FORMAT_PROMPT = "<think> [Your thoughts] </think> <answer> [your answer] </answer>" if self.config.agent_proxy.enable_think else "<answer> [your answer] </answer>"
-        LENGTH_PROMPT = f"Max response length: {self.env_config_lookup[env_output['env_id']]['max_tokens']} words (tokens)."
+        FORMAT_PROMPT, LENGTH_PROMPT = self._build_format_prompt(env_output["env_id"])
         warning = ""
         if include_warning and history[turn_idx].get('manager_invalid_action'):
             warning = "No valid action provided previously. Environment state remains the same. Please try again.\n"
