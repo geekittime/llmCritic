@@ -35,7 +35,7 @@ export HTTP_PROXY="${HTTP_PROXY:-${DEEPSEEK_PROXY}}"
 export HTTPS_PROXY="${HTTPS_PROXY:-${DEEPSEEK_PROXY}}"
 export http_proxy="${http_proxy:-${HTTP_PROXY}}"
 export https_proxy="${https_proxy:-${HTTPS_PROXY}}"
-export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,api.wandb.ai,wandb.ai"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,api.wandb.ai,wandb.ai,storage.googleapis.com"
 export no_proxy="${NO_PROXY}"
 
 case "${EXPERIMENT_PROFILE:-smoke}" in
