@@ -1,5 +1,7 @@
 # from .alfworld.config import AlfredEnvConfig
 # from .alfworld.env import AlfredTXTEnv
+import importlib.util
+
 from .bandit.config import BanditEnvConfig
 from .bandit.env import BanditEnv
 from .countdown.config import CountdownEnvConfig
@@ -46,10 +48,24 @@ REGISTERED_ENV_CONFIGS = {
     'rubikscube': RubiksCube2x2Config,
 }
 
-try:
-    from .webshop.env import WebShopEnv
-    from .webshop.config import WebShopEnvConfig
-    REGISTERED_ENVS['webshop'] = WebShopEnv
-    REGISTERED_ENV_CONFIGS['webshop'] = WebShopEnvConfig
-except ImportError:
-    pass
+if importlib.util.find_spec("webshop_minimal") is not None:
+    class LazyWebShopEnv:
+        """Load WebShop and its Java search backend only when selected."""
+
+        def __new__(cls, *args, **kwargs):
+            from .webshop.env import WebShopEnv
+
+            return WebShopEnv(*args, **kwargs)
+
+
+    class LazyWebShopEnvConfig:
+        """Defer importing webshop_minimal until a WebShop run starts."""
+
+        def __new__(cls, *args, **kwargs):
+            from .webshop.config import WebShopEnvConfig
+
+            return WebShopEnvConfig(*args, **kwargs)
+
+
+    REGISTERED_ENVS["webshop"] = LazyWebShopEnv
+    REGISTERED_ENV_CONFIGS["webshop"] = LazyWebShopEnvConfig
