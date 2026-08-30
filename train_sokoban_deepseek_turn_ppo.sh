@@ -72,6 +72,9 @@ fi
 export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARN}"
+# This is a single-node launcher. Never inherit a pointer to another user's
+# persistent Ray cluster on a shared host.
+unset RAY_ADDRESS
 RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
 safe_run_name="$(printf '%s' "${RUN_NAME}" | tr -c 'A-Za-z0-9_.-' '_')"
 if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then

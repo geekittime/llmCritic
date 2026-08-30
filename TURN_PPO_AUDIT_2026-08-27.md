@@ -262,7 +262,7 @@ CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-v4-flash \
 3. API batch 在 actor old-log-prob/reward 计算期间由后台线程执行；同一批的所有 turn 并发，训练只在消费 label 时等待。跨线程调用使用 caller-local metadata snapshot，避免 W&B 指标串批；同步桥另有最终 safety deadline。
 4. `last_turn` outcome 使用 `(episode_ids, trajectory_turn_ids)` 找到每条轨迹的真正末 turn；可选 advantage normalization 只在 turn endpoint 上按 sample weights 统计，消除 token 长度和复制 padding 偏差。
 5. exact turn PPO 启动时强制 value critic 关闭、Ulysses SP=1、entropy=0、actor token-KL loss 关闭；尚未正确支持的组合直接 fail fast，不再静默训练错误目标。
-6. Ray 的 `runtime_env` 不再包含 DeepSeek/W&B key。launcher 只把 mode-600 credential-file 路径传给 Hydra，文件内容在 Ray `TaskRunner` 内读取；Ray dashboard 关闭，Ray/cache/temp 父目录权限为 700。凭据文件只允许 `DEEPSEEK_API_KEY` 和 `WANDB_API_KEY`，不会 source 任意 shell，也不会在格式错误时回显原始内容。
+6. Ray 的 `runtime_env` 不再包含 DeepSeek/W&B key。launcher 只把 mode-600 credential-file 路径传给 Hydra，文件内容在 Ray `TaskRunner` 内读取；Ray 强制 `address="local"`、清除继承的 `RAY_ADDRESS` 并关闭 dashboard，避免误连其他用户集群；Ray/cache/temp 父目录权限为 700。凭据文件只允许 `DEEPSEEK_API_KEY` 和 `WANDB_API_KEY`，不会 source 任意 shell，也不会在格式错误时回显原始内容。
 7. launcher 使用短路径 `/data/kangshijia/rt` 避免 Ray Unix socket 超长；TorchInductor、Triton、HF、TMP 和 W&B 文件迁到 `/data`，避免 A100-004 根盘接近满载。它还校验 GPU ID 唯一、确实存在、数量与 Hydra 一致，并拒绝多卡 smoke 的错误 batch 配置。
 8. `train` profile 增加 `CONFIRM_DEEPSEEK_COST=1` 门槛。默认上界可达 `8 * 8 * 5 * 2000 = 640000` 个 turn label（未扣除提前终止/缓存，未计重试），必须先检查 smoke 的 API/parse 指标。
 

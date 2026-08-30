@@ -289,6 +289,7 @@ def run_ppo(config) -> None:
             "RAY_DEBUG": "legacy",  # used here for simpler breakpoint()
         }
         ray.init(
+            address="local",
             include_dashboard=False,
             runtime_env={'env_vars': ray_env_vars},
         )
