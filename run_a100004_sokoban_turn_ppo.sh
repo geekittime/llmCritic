@@ -56,7 +56,10 @@ case "${EXPERIMENT_PROFILE:-smoke}" in
         export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
         export TEST_FREQ="${TEST_FREQ:--1}"
         export SAVE_FREQ="${SAVE_FREQ:--1}"
-        export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
+        # GPUs 0-3 carry roughly 16-19 GiB of unrelated resident allocations.
+        # vLLM applies this limit to total device memory, so 0.40 leaves no KV
+        # blocks after the colocated FSDP actor is loaded.
+        export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
         export DEEPSEEK_MAX_CONCURRENCY="${DEEPSEEK_MAX_CONCURRENCY:-4}"
         export OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
         ;;
@@ -77,7 +80,7 @@ case "${EXPERIMENT_PROFILE:-smoke}" in
         export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
         export TEST_FREQ="${TEST_FREQ:-25}"
         export SAVE_FREQ="${SAVE_FREQ:-200}"
-        export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.55}"
+        export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
         export DEEPSEEK_MAX_CONCURRENCY="${DEEPSEEK_MAX_CONCURRENCY:-16}"
         export OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-False}"
         ;;
