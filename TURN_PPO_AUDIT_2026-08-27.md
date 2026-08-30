@@ -253,7 +253,7 @@ CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-v4-flash \
 
 ## 2026-08-30 最终复核与远端验证
 
-本节覆盖并取代上文 2026-08-28 的运行状态和测试数字。当前实现 checkpoint 为 `7baeb79`（`fix: harden efficient turn critic training`），分支仍为 `feature/turn-ppo-deepseek-progress`，已推送到 `geekittime/llmCritic`；A100-004 的 `/data/kangshijia/wangbinyu/llm-critic` 已 fast-forward 到相同提交。
+本节覆盖并取代上文 2026-08-28 的运行状态和测试数字。核心实现 checkpoint 为 `7baeb79`（`fix: harden efficient turn critic training`），Ray 隔离补丁为 `ec26ec4`（`fix: force isolated local Ray cluster`）。分支仍为 `feature/turn-ppo-deepseek-progress`，已推送到 `geekittime/llmCritic`；A100-004 的 `/data/kangshijia/wangbinyu/llm-critic` 已同步包含这两个提交。
 
 ### 本轮修复
 
