@@ -2,6 +2,7 @@
 # A100-004 launcher for a W&B-tracked Sokoban turn-PPO experiment.
 # No credential is stored here.  Put exports in the mode-600 SECRETS_FILE.
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -13,15 +14,20 @@ fi
 
 export PYTHON_BIN="${PYTHON_BIN:-/home/kangshijia/miniconda3/envs/ragen-vanilla/bin/python}"
 export MODEL_PATH="${MODEL_PATH:-/data/models/Qwen2.5-3B-Instruct}"
-export SECRETS_FILE="${SECRETS_FILE:-${HOME}/.config/llm-critic/secrets.env}"
+# Use '-' rather than ':-' so callers can explicitly disable credential-file
+# loading for a no-network DRY_RUN with SECRETS_FILE=''.
+export SECRETS_FILE="${SECRETS_FILE-${HOME}/.config/llm-critic/secrets.env}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_ENTITY="${WANDB_ENTITY:-MuLab-RL}"
 export WANDB_PROJECT="${WANDB_PROJECT:-llm-critic-turn-ppo}"
 
 run_stamp="$(date +%Y%m%d-%H%M%S)"
 export RUN_NAME="${RUN_NAME:-a100004-sokoban-turn-ppo-${EXPERIMENT_PROFILE:-smoke}-${run_stamp}}"
-export RAY_TMPDIR="${RAY_TMPDIR:-/data/kangshijia/ray/${RUN_NAME}}"
-export WANDB_DIR="${WANDB_DIR:-${RAY_TMPDIR}/wandb}"
+# Ray appends a long session/sockets suffix, so its root must remain short.
+# W&B can use a separate per-run directory because it does not create Unix
+# domain sockets under this path.
+export RAY_TMPDIR="${RAY_TMPDIR:-/data/kangshijia/rt}"
+export WANDB_DIR="${WANDB_DIR:-/data/kangshijia/wb/${RUN_NAME}}"
 
 # DeepSeek needs the local proxy on A100-004, while W&B works directly.
 export DEEPSEEK_PROXY="${DEEPSEEK_PROXY:-http://127.0.0.1:7890}"
@@ -34,6 +40,11 @@ export no_proxy="${NO_PROXY}"
 
 case "${EXPERIMENT_PROFILE:-smoke}" in
     smoke)
+        IFS=',' read -r -a reserved_gpu_ids <<< "${CUDA_DEVICES}"
+        if (( ${#reserved_gpu_ids[@]} != 1 )); then
+            echo "The smoke profile requires exactly one reserved GPU; use EXPERIMENT_PROFILE=train for multi-GPU runs." >&2
+            exit 2
+        fi
         export TRAIN_ENV_GROUPS="${TRAIN_ENV_GROUPS:-1}"
         export TRAIN_GROUP_SIZE="${TRAIN_GROUP_SIZE:-1}"
         export VAL_ENV_GROUPS="${VAL_ENV_GROUPS:-1}"
@@ -50,6 +61,11 @@ case "${EXPERIMENT_PROFILE:-smoke}" in
         export OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
         ;;
     train)
+        if [[ "${DRY_RUN:-0}" != "1" && "${CONFIRM_DEEPSEEK_COST:-0}" != "1" ]]; then
+            echo "The train profile can issue hundreds of thousands of turn judgments." >&2
+            echo "Run and inspect the smoke profile first, then set CONFIRM_DEEPSEEK_COST=1." >&2
+            exit 2
+        fi
         export TRAIN_ENV_GROUPS="${TRAIN_ENV_GROUPS:-8}"
         export TRAIN_GROUP_SIZE="${TRAIN_GROUP_SIZE:-8}"
         export VAL_ENV_GROUPS="${VAL_ENV_GROUPS:-8}"
@@ -76,6 +92,7 @@ export RESPONSE_LENGTH="${RESPONSE_LENGTH:-40}"
 export USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
 export USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 export ENTROPY_COEFF="${ENTROPY_COEFF:-0.0}"
+export FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-True}"
 export DEEPSEEK_TIMEOUT="${DEEPSEEK_TIMEOUT:-15}"
 export DEEPSEEK_BATCH_TIMEOUT="${DEEPSEEK_BATCH_TIMEOUT:-120}"
 export DEEPSEEK_MAX_RETRIES="${DEEPSEEK_MAX_RETRIES:-1}"

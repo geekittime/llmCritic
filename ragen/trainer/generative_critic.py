@@ -18,12 +18,13 @@ import os
 import re
 import time
 import asyncio
+import concurrent.futures
 import hashlib
 import inspect
 import random
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -83,6 +84,20 @@ class DeepSeekGenerationResult:
     input_tokens: int = 0
     output_tokens: int = 0
     usage_reported: bool = False
+
+
+@dataclass
+class DeepSeekRequestStats:
+    http_attempts: int = 0
+    retries: int = 0
+    error_counts: Dict[str, int] = field(default_factory=dict)
+
+    def record_error(self, kind: str) -> None:
+        self.error_counts[kind] = self.error_counts.get(kind, 0) + 1
+
+
+class DeepSeekBatchRequestError(RuntimeError):
+    """Sanitized aggregate error for strict API-health mode."""
 
 
 class FrozenGenerativeCritic:
@@ -250,6 +265,8 @@ class FrozenGenerativeCritic:
         self._deepseek_event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._deepseek_event_loop_thread: Optional[threading.Thread] = None
         self._deepseek_transport_lock = threading.Lock()
+        self._deepseek_inference_lock = threading.Lock()
+        self._generation_metadata_local = threading.local()
         self._deepseek_cache: "OrderedDict[str, str]" = OrderedDict()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._last_generation_metadata: Dict[str, float] = {}
@@ -821,6 +838,7 @@ class FrozenGenerativeCritic:
             "gen_critic/api_batch_timeout": 0.0,
             "gen_critic/api_cache_hit_count": 0.0,
             "gen_critic/api_request_count": 0.0,
+            "gen_critic/api_scheduled_request_count": 0.0,
             "gen_critic/api_deduplicated_count": 0.0,
             "gen_critic/api_cache_hit_rate": 0.0,
             "gen_critic/api_deduplicated_rate": 0.0,
@@ -844,10 +862,12 @@ class FrozenGenerativeCritic:
         deduplicated_count: int,
         request_count: int,
         retry_count: int,
+        http_attempt_count: Optional[int] = None,
     ) -> None:
         wall_time = max(time.perf_counter() - started_at, 1e-9)
         denominator = float(max(prompt_count, 1))
-        http_attempt_count = request_count + retry_count
+        if http_attempt_count is None:
+            http_attempt_count = request_count + retry_count
         self._last_generation_metadata.update(
             {
                 "gen_critic/api_cache_hit_rate": float(cache_hits) / denominator,
@@ -1101,8 +1121,11 @@ class FrozenGenerativeCritic:
         request_prompt: str,
         semaphore: asyncio.Semaphore,
         client: Optional[Any] = None,
+        request_stats: Optional[DeepSeekRequestStats] = None,
     ) -> DeepSeekGenerationResult:
         """Generate one critic response, returning text/retries/error-kind."""
+        if request_stats is None:
+            request_stats = DeepSeekRequestStats()
         if client is None:
             client = self._get_deepseek_client()
         last_kind: Optional[str] = None
@@ -1111,6 +1134,10 @@ class FrozenGenerativeCritic:
         for attempt in range(attempts):
             try:
                 async with semaphore:
+                    # Increment only after acquiring the concurrency slot. A
+                    # task canceled while waiting on the semaphore never made
+                    # an HTTP request and must not inflate cost metrics.
+                    request_stats.http_attempts += 1
                     request_kwargs = {
                         "model": self.deepseek_model,
                         "messages": self._build_deepseek_messages(request_prompt),
@@ -1132,9 +1159,11 @@ class FrozenGenerativeCritic:
                 choices = choices or []
                 if not choices:
                     last_kind = "empty_response"
+                    request_stats.record_error(last_kind)
                     if attempt >= attempts - 1:
                         return DeepSeekGenerationResult("", retries, last_kind)
                     retries += 1
+                    request_stats.retries += 1
                     await asyncio.sleep(self._retry_delay(attempt))
                     continue
                 choice = choices[0]
@@ -1144,16 +1173,19 @@ class FrozenGenerativeCritic:
                 # mapping rather than a pydantic object.
                 if content is None and isinstance(message, dict):
                     content = message.get("content")
-                if content is None:
+                content_text = str(content).strip() if content is not None else ""
+                if not content_text:
                     last_kind = "empty_response"
+                    request_stats.record_error(last_kind)
                     if attempt >= attempts - 1:
                         return DeepSeekGenerationResult("", retries, last_kind)
                     retries += 1
+                    request_stats.retries += 1
                     await asyncio.sleep(self._retry_delay(attempt))
                     continue
                 input_tokens, output_tokens, usage_reported = self._extract_usage_tokens(response)
                 return DeepSeekGenerationResult(
-                    str(content).strip(),
+                    content_text,
                     retries,
                     None,
                     input_tokens=input_tokens,
@@ -1162,19 +1194,37 @@ class FrozenGenerativeCritic:
                 )
             except Exception as exc:  # noqa: BLE001 - SDK exception types vary by version
                 last_kind = self._classify_api_error(exc)
+                request_stats.record_error(last_kind)
                 if attempt >= attempts - 1 or not self._is_retryable_api_error(exc):
                     return DeepSeekGenerationResult("", retries, last_kind)
                 retries += 1
+                request_stats.retries += 1
                 # Exponential backoff is capped to keep a rollout from
                 # blocking indefinitely when the provider is rate-limited.
                 await asyncio.sleep(self._retry_delay(attempt))
         return DeepSeekGenerationResult("", retries, last_kind or "other")
 
-    def _run_async_from_sync(self, coro_factory: Callable[[], Any]) -> Any:
+    def _run_async_from_sync(
+        self,
+        coro_factory: Callable[[], Any],
+        timeout: Optional[float] = None,
+    ) -> Any:
         """Submit work to the persistent transport loop from any sync caller."""
         loop = self._ensure_deepseek_event_loop()
         future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
-        return future.result()
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("DeepSeek transport exceeded the synchronous safety deadline") from exc
+
+    def _deepseek_sync_timeout(self) -> float:
+        """Bound the sync bridge even if a transport ignores cancellation."""
+        if self.deepseek_batch_timeout > 0:
+            return self.deepseek_batch_timeout + self.deepseek_timeout + 5.0
+        request_budget = self.deepseek_timeout * (self.deepseek_max_retries + 1)
+        backoff_budget = sum(min(2.0**attempt, 8.0) + 0.25 for attempt in range(self.deepseek_max_retries))
+        return request_budget + backoff_budget + 5.0
 
     def _deepseek_cache_key(self, prompt: str) -> str:
         """Return a stable, non-sensitive cache key for one request."""
@@ -1216,6 +1266,27 @@ class FrozenGenerativeCritic:
             self._deepseek_cache.popitem(last=False)
 
     def _generate_texts_with_deepseek(self, prompts: Sequence[str]) -> List[str]:
+        # The trainer submits one batch at a time. Serializing any external
+        # callers as well keeps the persistent LRU, per-batch metrics, and
+        # global concurrency limit coherent across threads.
+        with self._deepseek_inference_lock:
+            try:
+                return self._generate_texts_with_deepseek_locked(prompts)
+            finally:
+                # The public metadata attribute remains useful for sequential
+                # diagnostics. Keep a caller-local snapshot as well so a second
+                # thread cannot replace the first call's W&B metrics after the
+                # HTTP lock is released but before score parsing finishes.
+                self._generation_metadata_local.value = dict(self._last_generation_metadata)
+
+    def _generation_metadata_snapshot(self) -> Dict[str, float]:
+        if self.backend in {"deepseek_api", "deepseek"}:
+            snapshot = getattr(self._generation_metadata_local, "value", None)
+            if snapshot is not None:
+                return dict(snapshot)
+        return dict(self._last_generation_metadata)
+
+    def _generate_texts_with_deepseek_locked(self, prompts: Sequence[str]) -> List[str]:
         started_at = time.perf_counter()
         self._reset_generation_metadata()
         if not prompts:
@@ -1288,9 +1359,17 @@ class FrozenGenerativeCritic:
         async def run_batch() -> List[str]:
             client = self._get_deepseek_client()
             semaphore = asyncio.Semaphore(self.deepseek_max_concurrency)
+            request_stats = [DeepSeekRequestStats() for _ in unique_prompts]
             tasks = [
-                asyncio.create_task(self._generate_one_deepseek(prompt, semaphore, client))
-                for prompt in unique_prompts
+                asyncio.create_task(
+                    self._generate_one_deepseek(
+                        prompt,
+                        semaphore,
+                        client,
+                        request_stats=stats,
+                    )
+                )
+                for prompt, stats in zip(unique_prompts, request_stats, strict=True)
             ]
             timed_out_indices: set[int] = set()
             if self.deepseek_batch_timeout > 0:
@@ -1320,7 +1399,9 @@ class FrozenGenerativeCritic:
             # failed label per affected turn in W&B metrics.
             failure_count = 0
             unique_failure_count = 0
-            retry_count = 0
+            retry_count = sum(stats.retries for stats in request_stats)
+            http_attempt_count = sum(stats.http_attempts for stats in request_stats)
+            actual_request_count = sum(stats.http_attempts > 0 for stats in request_stats)
             auth_count = 0
             rate_limit_count = 0
             timeout_count = 0
@@ -1328,22 +1409,24 @@ class FrozenGenerativeCritic:
             output_token_count = 0
             usage_reported_request_count = 0
             batch_timeout_count = 0
-            for result in results:
+            for result, stats in zip(results, request_stats, strict=True):
                 generated_outputs.append(result.text)
-                retry_count += result.retries
                 input_token_count += result.input_tokens
                 output_token_count += result.output_tokens
                 usage_reported_request_count += int(result.usage_reported)
+                unique_index = len(generated_outputs) - 1
+                multiplicity = unique_multiplicity[unique_index]
+                auth_count += multiplicity * stats.error_counts.get("auth", 0)
+                rate_limit_count += multiplicity * stats.error_counts.get("rate_limit", 0)
+                timeout_count += multiplicity * stats.error_counts.get("timeout", 0)
                 if result.error_kind is not None:
-                    unique_index = len(generated_outputs) - 1
-                    failure_count += unique_multiplicity[unique_index]
+                    failure_count += multiplicity
                     unique_failure_count += 1
-                    auth_count += unique_multiplicity[unique_index] * int(result.error_kind == "auth")
-                    rate_limit_count += unique_multiplicity[unique_index] * int(result.error_kind == "rate_limit")
-                    timeout_count += unique_multiplicity[unique_index] * int(result.error_kind == "timeout")
-                    batch_timeout_count += unique_multiplicity[unique_index] * int(
+                    batch_timeout_count += multiplicity * int(
                         unique_index in timed_out_indices
                     )
+                    if unique_index in timed_out_indices and stats.error_counts.get("timeout", 0) == 0:
+                        timeout_count += multiplicity
 
             count = float(max(len(prompt_list), 1))
             self._last_generation_metadata.update(
@@ -1360,18 +1443,32 @@ class FrozenGenerativeCritic:
                     "gen_critic/api_batch_timeout_count": float(batch_timeout_count),
                     "gen_critic/api_batch_timeout": float(bool(timed_out_indices)),
                     "gen_critic/api_cache_hit_count": float(cache_hits),
-                    "gen_critic/api_request_count": float(len(unique_prompts)),
+                    "gen_critic/api_request_count": float(actual_request_count),
+                    "gen_critic/api_scheduled_request_count": float(len(unique_prompts)),
                     "gen_critic/api_deduplicated_count": float(deduplicated_count),
+                    "gen_critic/api_http_attempt_count": float(http_attempt_count),
                     "gen_critic/api_input_token_count": float(input_token_count),
                     "gen_critic/api_output_token_count": float(output_token_count),
                     "gen_critic/api_total_token_count": float(input_token_count + output_token_count),
                     "gen_critic/api_usage_reported_request_count": float(usage_reported_request_count),
                 }
             )
+            if self.deepseek_raise_on_error and unique_failure_count:
+                failure_kinds = sorted(
+                    {result.error_kind for result in results if result.error_kind is not None}
+                )
+                raise DeepSeekBatchRequestError(
+                    "DeepSeek critic batch failed for "
+                    f"{unique_failure_count}/{len(unique_prompts)} request(s); "
+                    f"kinds={','.join(failure_kinds)}"
+                )
             return generated_outputs
 
         try:
-            generated_outputs = self._run_async_from_sync(run_batch)
+            generated_outputs = self._run_async_from_sync(
+                run_batch,
+                timeout=self._deepseek_sync_timeout(),
+            )
             # Fill all duplicate positions and cache only successful text.
             for key, output in zip(unique_keys, generated_outputs, strict=True):
                 self._cache_put(key, output)
@@ -1384,11 +1481,16 @@ class FrozenGenerativeCritic:
                 prompt_count=len(prompt_list),
                 cache_hits=cache_hits,
                 deduplicated_count=deduplicated_count,
-                request_count=len(unique_prompts),
+                request_count=int(self._last_generation_metadata["gen_critic/api_request_count"]),
                 retry_count=retry_count,
+                http_attempt_count=int(
+                    self._last_generation_metadata["gen_critic/api_http_attempt_count"]
+                ),
             )
             return [str(value or "") for value in outputs]
         except Exception as exc:  # noqa: BLE001 - includes missing key/import/client setup
+            if isinstance(exc, DeepSeekBatchRequestError) and self.deepseek_raise_on_error:
+                raise
             kind = self._classify_api_error(exc)
             failed_prompt_count = len(prompt_list) - cache_hits
             count = float(max(failed_prompt_count, 1))
@@ -1424,9 +1526,10 @@ class FrozenGenerativeCritic:
             return [str(value or "") for value in outputs]
 
     def _generate_texts(self, prompts: Sequence[str]) -> List[str]:
-        self._reset_generation_metadata()
         if self.backend in {"deepseek_api", "deepseek"}:
             return self._generate_texts_with_deepseek(prompts)
+
+        self._reset_generation_metadata()
 
         if self.backend in {"actor_rollout_vllm", "vllm_actor_rollout", "actor_vllm", "vllm"}:
             if self._generate_fn is None:
@@ -1594,7 +1697,7 @@ class FrozenGenerativeCritic:
             "gen_critic/negative_rate": float(negative_count) / max(num_prompts, 1.0),
             "gen_critic/score_mean": float(sum(scores)) / max(num_prompts, 1.0),
         }
-        metrics.update(self._last_generation_metadata)
+        metrics.update(self._generation_metadata_snapshot())
         return label_tensor, metrics, outputs
 
     def infer_turn_scores(

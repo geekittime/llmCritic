@@ -6,12 +6,16 @@
 # stores command-line overrides in `.hydra/overrides.yaml` and they can also be
 # visible in process listings.
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-# Optionally load credentials from a caller-owned, mode-600 file.  This keeps
-# secrets out of Hydra overrides, process listings, the repository, and W&B.
+# Validate a caller-owned credential file without exporting its contents. The
+# Ray TaskRunner reads it after scheduling, keeping values out of Ray job
+# runtime_env metadata, process environments, and runtime-env logs.
+credential_file_has_deepseek=0
+credential_file_has_wandb=0
 if [[ -n "${SECRETS_FILE:-}" ]]; then
     if [[ ! -r "${SECRETS_FILE}" ]]; then
         echo "Secrets file is not readable: ${SECRETS_FILE}" >&2
@@ -22,13 +26,48 @@ if [[ -n "${SECRETS_FILE:-}" ]]; then
         echo "Secrets file must not be accessible by group/other: ${SECRETS_FILE}" >&2
         exit 2
     fi
-    set -a
-    # shellcheck disable=SC1090
-    source "${SECRETS_FILE}"
-    set +a
+    # Parse only credential assignments. Sourcing arbitrary shell here would
+    # let a credentials file override CUDA_DEVICES or other reviewed training
+    # settings after the caller reserved a GPU.
+    secret_line_number=0
+    while IFS= read -r secret_line || [[ -n "${secret_line}" ]]; do
+        secret_line_number=$((secret_line_number + 1))
+        secret_line="${secret_line%$'\r'}"
+        [[ -z "${secret_line}" || "${secret_line}" == \#* ]] && continue
+        secret_line="${secret_line#export }"
+        secret_name="${secret_line%%=*}"
+        secret_value="${secret_line#*=}"
+        if [[ "${secret_name}" == "${secret_line}" ]]; then
+            echo "Invalid assignment in secrets file at line ${secret_line_number}" >&2
+            exit 2
+        fi
+        case "${secret_name}" in
+            DEEPSEEK_API_KEY)
+                [[ -n "${secret_value}" ]] || { echo "Empty DEEPSEEK_API_KEY in secrets file" >&2; exit 2; }
+                credential_file_has_deepseek=1
+                ;;
+            WANDB_API_KEY)
+                [[ -n "${secret_value}" ]] || { echo "Empty WANDB_API_KEY in secrets file" >&2; exit 2; }
+                credential_file_has_wandb=1
+                ;;
+            *)
+                echo "Unsupported variable in secrets file at line ${secret_line_number}" >&2
+                exit 2
+                ;;
+        esac
+    done < "${SECRETS_FILE}"
+    # Keep rotated or stale inherited values out of raylet/GPU-worker base
+    # environments. TaskRunner will install the selected file values locally.
+    (( credential_file_has_deepseek == 0 )) || unset DEEPSEEK_API_KEY
+    (( credential_file_has_wandb == 0 )) || unset WANDB_API_KEY
 fi
 
-: "${DEEPSEEK_API_KEY:?Set DEEPSEEK_API_KEY in the environment before starting the run}"
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    if [[ -z "${DEEPSEEK_API_KEY:-}" && "${credential_file_has_deepseek}" != "1" ]]; then
+        echo "Set DEEPSEEK_API_KEY or provide it in a mode-600 SECRETS_FILE" >&2
+        exit 2
+    fi
+fi
 
 export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
@@ -36,26 +75,46 @@ export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARN}"
 RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
 safe_run_name="$(printf '%s' "${RUN_NAME}" | tr -c 'A-Za-z0-9_.-' '_')"
 if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
-    default_ray_tmp="/data/${USER}/ray/llm-critic-${safe_run_name}"
+    # Ray appends a long session/sockets suffix. Keep this root deliberately
+    # short so Unix-domain socket paths stay below the platform limit.
+    default_ray_tmp="/data/${USER}/rt"
+    default_wandb_dir="/data/${USER}/wb/${safe_run_name}"
+    default_tmp_dir="/data/${USER}/tmp/${safe_run_name}"
+    default_cache_dir="/data/${USER}/cache"
 else
-    default_ray_tmp="/tmp/ray-${USER:-ragen}-${safe_run_name}"
+    default_ray_tmp="/tmp/${USER:-ragen}-rt"
+    default_wandb_dir="/tmp/${USER:-ragen}-wb/${safe_run_name}"
+    default_tmp_dir="/tmp/${USER:-ragen}-tmp/${safe_run_name}"
+    default_cache_dir="/tmp/${USER:-ragen}-cache"
 fi
 export RAY_TMPDIR="${RAY_TMPDIR:-${default_ray_tmp}}"
+ray_tmp_bytes="$(LC_ALL=C printf '%s' "${RAY_TMPDIR}" | wc -c)"
+if (( ray_tmp_bytes > 32 )); then
+    echo "RAY_TMPDIR is too long for Ray Unix sockets (${ray_tmp_bytes} bytes; max 32): ${RAY_TMPDIR}" >&2
+    exit 2
+fi
 mkdir -p "${RAY_TMPDIR}"
+chmod 700 "${RAY_TMPDIR}"
+export TMPDIR="${TMPDIR:-${default_tmp_dir}}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${default_cache_dir}}"
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${XDG_CACHE_HOME}/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${XDG_CACHE_HOME}/triton}"
+mkdir -p "${TMPDIR}" "${HF_HOME}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
 
 # W&B can authenticate through WANDB_API_KEY or a mode-600 ~/.netrc.  Callers
 # can always force WANDB_MODE=online/offline; no credential is embedded here.
 export WANDB_ENTITY="${WANDB_ENTITY:-MuLab-RL}"
 export WANDB_PROJECT="${WANDB_PROJECT:-llm-critic-turn-ppo}"
 if [[ -z "${WANDB_MODE:-}" ]]; then
-    if [[ -n "${WANDB_API_KEY:-}" ]] || { [[ -r "${HOME}/.netrc" ]] && grep -q 'api\.wandb\.ai' "${HOME}/.netrc"; }; then
+    if [[ -n "${WANDB_API_KEY:-}" || "${credential_file_has_wandb}" == "1" ]] || { [[ -r "${HOME}/.netrc" ]] && grep -q 'api\.wandb\.ai' "${HOME}/.netrc"; }; then
         WANDB_MODE=online
     else
         WANDB_MODE=offline
     fi
 fi
 export WANDB_MODE
-export WANDB_DIR="${WANDB_DIR:-${RAY_TMPDIR}/wandb}"
+export WANDB_DIR="${WANDB_DIR:-${default_wandb_dir}}"
 mkdir -p "${WANDB_DIR}"
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
@@ -95,13 +154,34 @@ fi
 # Set CUDA_DEVICES only to GPUs reserved for this job.  The default is useful
 # for a single-GPU smoke run; on shared machines callers should always pass an
 # explicitly reserved device list.
-CUDA_DEVICES="${CUDA_DEVICES:-0}"
+: "${CUDA_DEVICES:?Set CUDA_DEVICES to GPUs explicitly reserved for this run}"
+if [[ ! "${CUDA_DEVICES}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "CUDA_DEVICES must be a comma-separated list of integer GPU IDs: ${CUDA_DEVICES}" >&2
+    exit 2
+fi
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_DEVICES}"
+declare -A seen_gpu_ids=()
+available_gpu_ids=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    available_gpu_ids=",$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | paste -sd, - | tr -d '[:space:]' || true),"
+fi
+for gpu_id in "${GPU_IDS[@]}"; do
+    if [[ -n "${seen_gpu_ids[${gpu_id}]:-}" ]]; then
+        echo "CUDA_DEVICES contains a duplicate GPU ID: ${gpu_id}" >&2
+        exit 2
+    fi
+    seen_gpu_ids["${gpu_id}"]=1
+    if [[ "${available_gpu_ids}" != ",," && "${available_gpu_ids}" != *",${gpu_id},"* ]]; then
+        echo "CUDA_DEVICES references a GPU not reported by nvidia-smi: ${gpu_id}" >&2
+        exit 2
+    fi
+done
 N_GPUS="${N_GPUS:-${#GPU_IDS[@]}}"
 if [[ "${N_GPUS}" -ne "${#GPU_IDS[@]}" ]]; then
     echo "N_GPUS (${N_GPUS}) must match CUDA_DEVICES (${CUDA_DEVICES})" >&2
     exit 2
 fi
+export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 
 PROJECT_NAME="${WANDB_PROJECT}"
 
@@ -119,13 +199,22 @@ MAX_ACTIONS_PER_TURN="${MAX_ACTIONS_PER_TURN:-1}"
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-40}"
 DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-v4-flash}"
 
+if (( PPO_MINI_BATCH_SIZE % (MICRO_BATCH_SIZE * N_GPUS) != 0 )); then
+    echo "PPO_MINI_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * N_GPUS" >&2
+    exit 2
+fi
+if (( TRAIN_ENV_GROUPS * TRAIN_GROUP_SIZE < PPO_MINI_BATCH_SIZE )); then
+    echo "TRAIN_ENV_GROUPS * TRAIN_GROUP_SIZE must be >= PPO_MINI_BATCH_SIZE" >&2
+    exit 2
+fi
+
 # A fresh run is the default; set RESUME_MODE=auto/resume_path explicitly when
 # continuing a known checkpoint.  ``DRY_RUN=1`` asks Hydra to render the fully
 # resolved job config and exit before Ray/model initialization.
 
 TRAIN_ARGS=(
     --config-name _2_sokoban
-    "system.CUDA_VISIBLE_DEVICES=${CUDA_DEVICES}"
+    "system.CUDA_VISIBLE_DEVICES='${CUDA_DEVICES}'"
     "trainer.n_gpus_per_node=${N_GPUS}"
     "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${RUN_NAME}"
@@ -153,6 +242,7 @@ TRAIN_ARGS=(
     "actor_rollout_ref.rollout.rollout_filter_ratio=1.0"
     "actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
+    "actor_rollout_ref.rollout.free_cache_engine=${FREE_CACHE_ENGINE:-True}"
     "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ:-True}"
     "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
     "generative_critic.enable=True"
@@ -186,6 +276,10 @@ TRAIN_ARGS=(
     "algorithm.gamma=${GAMMA:-1.0}"
     "algorithm.lam=${LAMBDA:-0.95}"
 )
+
+if [[ -n "${SECRETS_FILE:-}" ]]; then
+    TRAIN_ARGS+=("generative_critic.deepseek_api_key_file=${SECRETS_FILE}")
+fi
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     MKL_SERVICE_FORCE_INTEL=1 "${PYTHON_CMD[@]}" train.py --cfg job "${TRAIN_ARGS[@]}"

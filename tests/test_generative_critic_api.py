@@ -8,7 +8,9 @@ which are the two failure modes that can silently corrupt an RL rollout.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
+import threading
 import time
 from types import SimpleNamespace
 
@@ -16,7 +18,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from ragen.trainer.generative_critic import FrozenGenerativeCritic
+from ragen.trainer.generative_critic import DeepSeekBatchRequestError, FrozenGenerativeCritic
 
 
 def _config(**critic_overrides):
@@ -219,6 +221,13 @@ def test_sync_api_call_is_safe_inside_an_active_event_loop():
     assert asyncio.run(invoke_sync_api()) == ["FINAL_SCORE: -1"]
 
 
+def test_sync_transport_bridge_has_a_safety_deadline():
+    critic = FrozenGenerativeCritic(_config())
+    with pytest.raises(TimeoutError, match="synchronous safety deadline"):
+        critic._run_async_from_sync(lambda: asyncio.sleep(10.0), timeout=0.01)
+    critic.close()
+
+
 def test_retry_delay_includes_small_bounded_jitter(monkeypatch):
     monkeypatch.setattr("ragen.trainer.generative_critic.random.uniform", lambda low, high: high)
     assert FrozenGenerativeCritic._retry_delay(0) == pytest.approx(1.1)
@@ -287,6 +296,107 @@ def test_auth_failure_does_not_retry_and_maps_to_negative():
     assert outputs == ["", ""]
     assert len(fake.chat.completions.calls) == 2
     assert critic._last_generation_metadata["gen_critic/api_auth_failure_count"] == 2.0
+
+
+def test_strict_api_mode_raises_sanitized_batch_error():
+    class _AuthError(Exception):
+        status_code = 401
+
+    critic = FrozenGenerativeCritic(
+        _config(deepseek_raise_on_error=True, deepseek_cache_enable=False)
+    )
+    critic._deepseek_client = _FakeClient(lambda kwargs: _AuthError("secret response body"))
+
+    with pytest.raises(DeepSeekBatchRequestError, match=r"kinds=auth") as exc_info:
+        critic._generate_texts(["one"])
+
+    assert "secret response body" not in str(exc_info.value)
+    assert critic._last_generation_metadata["gen_critic/api_auth_failure_count"] == 1.0
+
+
+def test_batch_deadline_counts_only_requests_that_acquired_the_semaphore():
+    async def responder(kwargs):
+        await asyncio.sleep(1.0)
+        return "FINAL_SCORE: 1"
+
+    fake = _FakeClient(responder)
+    critic = FrozenGenerativeCritic(
+        _config(
+            deepseek_batch_timeout=0.02,
+            deepseek_max_concurrency=1,
+            deepseek_max_retries=0,
+            deepseek_cache_enable=False,
+        )
+    )
+    critic._deepseek_client = fake
+
+    assert critic._generate_texts(["one", "two", "three"]) == ["", "", ""]
+    assert len(fake.chat.completions.calls) == 1
+    assert critic._last_generation_metadata["gen_critic/api_scheduled_request_count"] == 3.0
+    assert critic._last_generation_metadata["gen_critic/api_request_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_http_attempt_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_timeout_count"] == 3.0
+
+
+def test_recovered_rate_limit_is_counted_with_retry_and_http_attempts(monkeypatch):
+    class _RateLimitError(Exception):
+        status_code = 429
+
+    calls = 0
+
+    def responder(kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _RateLimitError()
+        return "FINAL_SCORE: 1"
+
+    critic = FrozenGenerativeCritic(
+        _config(deepseek_max_retries=1, deepseek_cache_enable=False)
+    )
+    monkeypatch.setattr(critic, "_retry_delay", lambda attempt: 0.0)
+    critic._deepseek_client = _FakeClient(responder)
+
+    assert critic._generate_texts(["one"]) == ["FINAL_SCORE: 1"]
+    assert critic._last_generation_metadata["gen_critic/api_failure_count"] == 0.0
+    assert critic._last_generation_metadata["gen_critic/api_rate_limit_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_retry_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_request_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_http_attempt_count"] == 2.0
+
+
+def test_empty_response_retries_then_reports_failure(monkeypatch):
+    critic = FrozenGenerativeCritic(
+        _config(deepseek_max_retries=1, deepseek_cache_enable=False)
+    )
+    monkeypatch.setattr(critic, "_retry_delay", lambda attempt: 0.0)
+    fake = _FakeClient(lambda kwargs: "")
+    critic._deepseek_client = fake
+
+    assert critic._generate_texts(["one"]) == [""]
+    assert len(fake.chat.completions.calls) == 2
+    assert critic._last_generation_metadata["gen_critic/api_failure_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_retry_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_http_attempt_count"] == 2.0
+
+
+def test_concurrent_callers_keep_their_own_generation_metrics():
+    critic = FrozenGenerativeCritic(
+        _config(deepseek_cache_enable=False, deepseek_max_concurrency=4)
+    )
+    critic._deepseek_client = _FakeClient(lambda kwargs: "FINAL_SCORE: 1")
+    barrier = threading.Barrier(2)
+
+    def generate(prompt_count):
+        outputs = critic._generate_texts([f"prompt-{prompt_count}-{i}" for i in range(prompt_count)])
+        barrier.wait(timeout=2.0)
+        metadata = critic._generation_metadata_snapshot()
+        return len(outputs), metadata["gen_critic/api_request_count"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(generate, [1, 2]))
+
+    assert results == [(1, 1.0), (2, 2.0)]
 
 
 def _messages(action: str):

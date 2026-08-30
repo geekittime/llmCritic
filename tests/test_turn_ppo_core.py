@@ -10,11 +10,16 @@ from ragen.llm_agent.ctx_manager import build_legacy_turn_metadata, build_turn_t
 from ragen.trainer.agent_trainer import (
     broadcast_outcome_to_turns,
     collapse_turn_scores,
+    normalize_turn_scores,
     place_turn_endpoint_rewards,
     trajectory_outcomes,
 )
 from ragen.trainer.core_algos import compute_turn_gae_advantage_return
-from ragen.workers.actor.dp_actor import DataParallelPPOActor, compute_turn_policy_loss
+from ragen.workers.actor.dp_actor import (
+    DataParallelPPOActor,
+    compute_turn_micro_batch_scale,
+    compute_turn_policy_loss,
+)
 from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
 from ragen.utils import redact_config
 
@@ -24,6 +29,7 @@ def test_tracker_config_redacts_nested_credentials_without_mutating_input():
         "generative_critic": {
             "deepseek_api_key": "sk-not-for-logs",
             "deepseek_api_key_env": "DEEPSEEK_API_KEY",
+            "deepseek_api_key_file": "/protected/secrets.env",
             "max_concurrency": 8,
         },
         "wandb_token": "wb-not-for-logs",
@@ -33,6 +39,7 @@ def test_tracker_config_redacts_nested_credentials_without_mutating_input():
 
     assert redacted["generative_critic"]["deepseek_api_key"] == "<redacted>"
     assert redacted["generative_critic"]["deepseek_api_key_env"] == "<redacted>"
+    assert redacted["generative_critic"]["deepseek_api_key_file"] == "<redacted>"
     assert redacted["wandb_token"] == "<redacted>"
     assert redacted["generative_critic"]["max_concurrency"] == 8
     assert config["generative_critic"]["deepseek_api_key"] == "sk-not-for-logs"
@@ -349,6 +356,56 @@ def test_inverse_multiplicity_weights_remove_copied_row_bias():
     assert torch.allclose(copied, original)
 
 
+def test_inverse_multiplicity_weights_survive_multiple_optimizer_steps():
+    old_log_prob = torch.zeros((3, 1))
+    log_prob = torch.tensor([[0.10], [-0.15], [0.20]])
+    advantages = torch.tensor([[1.0], [-0.5], [2.0]])
+    response_mask = torch.ones((3, 1))
+    turn_ids = torch.zeros((3, 1), dtype=torch.long)
+
+    full_loss = compute_turn_policy_loss(
+        old_log_prob,
+        log_prob,
+        advantages,
+        response_mask,
+        turn_ids,
+        cliprange=10.0,
+        cliprange_low=10.0,
+        cliprange_high=10.0,
+        clip_ratio_c=3.0,
+    )[0]
+
+    copied_indices = torch.tensor([0, 1, 2, 2])
+    copied_weights = torch.tensor([1.0, 1.0, 0.5, 0.5])
+    accumulated_loss = torch.zeros_like(full_loss)
+    for start in (0, 2):
+        indices = copied_indices[start : start + 2]
+        weights = copied_weights[start : start + 2]
+        mini_loss = compute_turn_policy_loss(
+            old_log_prob[indices],
+            log_prob[indices],
+            advantages[indices],
+            response_mask[indices],
+            turn_ids[indices],
+            cliprange=10.0,
+            cliprange_low=10.0,
+            cliprange_high=10.0,
+            clip_ratio_c=3.0,
+            sample_weights=weights,
+        )[0]
+        scale = compute_turn_micro_batch_scale(
+            micro_turn_weight=float(weights.sum()),
+            global_turn_weight=3.0,
+            num_mini_batches=2,
+            data_parallel_world_size=1,
+        )
+        accumulated_loss = accumulated_loss + mini_loss * scale
+
+    # Two optimizer steps together carry two copies of the global mean. The
+    # duplicated third row must not receive a full extra step of its own.
+    assert torch.allclose(accumulated_loss, 2.0 * full_loss)
+
+
 def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction():
     actor = object.__new__(DataParallelPPOActor)
     actor.config = SimpleNamespace(entropy_coeff=0.0)
@@ -393,6 +450,8 @@ def test_turn_reward_helpers_are_scalar_and_endpoint_based():
     token_scores = torch.tensor([[1.0, 3.0, 99.0, -2.0, -4.0]])
     turn_scores = collapse_turn_scores(token_scores, turn_ids, response_mask)
     assert torch.allclose(turn_scores, torch.tensor([[2.0, 2.0, 0.0, -3.0, -3.0]]))
+    summed_scores = collapse_turn_scores(token_scores, turn_ids, response_mask, reduction="sum")
+    assert torch.allclose(summed_scores, torch.tensor([[4.0, 4.0, 0.0, -6.0, -6.0]]))
 
     end_mask = torch.tensor([[0.0, 1.0, 0.0, 0.0, 1.0]])
     endpoint_scores = place_turn_endpoint_rewards(
@@ -408,6 +467,64 @@ def test_turn_reward_helpers_are_scalar_and_endpoint_based():
     )
     assert torch.allclose(all_turns, torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0]]))
     assert torch.allclose(last_turn, torch.tensor([[0.0, 0.0, 0.0, -1.0, -1.0]]))
+
+
+def test_last_turn_outcome_uses_episode_metadata_for_expanded_rows():
+    outcomes = torch.tensor([1.0, 1.0, 1.0, -1.0, -1.0])
+    turn_ids = torch.tensor([[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]])
+    response_mask = torch.ones_like(turn_ids, dtype=torch.float32)
+
+    result = broadcast_outcome_to_turns(
+        outcomes,
+        turn_ids,
+        response_mask,
+        mode="last_turn",
+        episode_ids=np.array([10, 10, 10, 11, 11]),
+        trajectory_turn_ids=np.array([0, 1, 2, 0, 1]),
+    )
+
+    assert result.tolist() == [
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [-1.0, -1.0],
+    ]
+
+
+def test_turn_normalization_ignores_token_length_and_copied_rows():
+    turn_scores = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0],
+            [-1.0, -1.0, -1.0, -1.0],
+            [-1.0, -1.0, -1.0, -1.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ]
+    )
+    turn_end_mask = torch.tensor(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    normalized = normalize_turn_scores(
+        turn_scores,
+        response_mask,
+        turn_end_mask,
+        sample_weights=torch.tensor([1.0, 0.5, 0.5]),
+    )
+
+    assert torch.allclose(normalized[0, :2], torch.ones(2))
+    assert torch.allclose(normalized[1, :], -torch.ones(4))
+    assert torch.allclose(normalized[2, :], -torch.ones(4))
+    assert torch.count_nonzero(normalized[0, 2:]) == 0
 
 
 def test_trajectory_outcomes_are_binary_and_failure_safe():

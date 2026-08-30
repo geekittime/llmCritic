@@ -9,7 +9,7 @@ import concurrent.futures
 import ray
 import torch
 import numpy as np
-from typing import Optional
+from typing import Any, Optional, Sequence
 from collections import defaultdict
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -322,7 +322,7 @@ def collapse_turn_scores(
     probabilities).  Padding/environment tokens are always zero.
     """
     _validate_turn_tensor_shapes(turn_ids, response_mask, token_scores)
-    if reduction not in {"mean", "first", "last"}:
+    if reduction not in {"mean", "sum", "first", "last"}:
         raise ValueError(f"Unsupported turn score reduction: {reduction}")
 
     scores = torch.zeros_like(token_scores, dtype=torch.float32)
@@ -338,8 +338,10 @@ def collapse_turn_scores(
                 scalar = values[0]
             elif reduction == "last":
                 scalar = values[-1]
-            else:
+            elif reduction == "mean":
                 scalar = values.mean()
+            else:
+                scalar = values.sum()
             scores[batch_index, mask] = scalar
     return scores.to(dtype=token_scores.dtype)
 
@@ -382,6 +384,8 @@ def broadcast_outcome_to_turns(
     turn_ids: torch.Tensor,
     response_mask: torch.Tensor,
     mode: str = "all_turns",
+    episode_ids: Optional[Sequence[Any]] = None,
+    trajectory_turn_ids: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """Broadcast one terminal outcome to the requested turn boundaries.
 
@@ -397,15 +401,74 @@ def broadcast_outcome_to_turns(
 
     result = torch.zeros_like(response_mask, dtype=torch.float32)
     valid = response_mask > 0
+    last_episode_rows: Optional[np.ndarray] = None
+    if mode == "last_turn" and episode_ids is not None and trajectory_turn_ids is not None:
+        episode_values = np.asarray(episode_ids).reshape(-1)
+        trajectory_values = np.asarray(trajectory_turn_ids).reshape(-1)
+        if episode_values.size != turn_ids.shape[0] or trajectory_values.size != turn_ids.shape[0]:
+            raise ValueError("episode_ids and trajectory_turn_ids must match the batch size")
+        last_turn_by_episode: dict[Any, int] = {}
+        for episode_id, trajectory_turn_id in zip(episode_values, trajectory_values, strict=True):
+            turn_number = int(trajectory_turn_id)
+            last_turn_by_episode[episode_id] = max(
+                last_turn_by_episode.get(episode_id, turn_number),
+                turn_number,
+            )
+        last_episode_rows = np.asarray(
+            [
+                int(turn_number) == last_turn_by_episode[episode_id]
+                for episode_id, turn_number in zip(episode_values, trajectory_values, strict=True)
+            ],
+            dtype=bool,
+        )
     for batch_index in range(turn_ids.shape[0]):
         ids = torch.unique(turn_ids[batch_index][valid[batch_index]], sorted=True).tolist()
-        if mode == "last_turn" and ids:
-            ids = ids[-1:]
+        if mode == "last_turn":
+            if last_episode_rows is not None and not bool(last_episode_rows[batch_index]):
+                ids = []
+            elif ids:
+                ids = ids[-1:]
         if mode == "none":
             ids = []
         for turn_id in ids:
             result[batch_index, (turn_ids[batch_index] == turn_id) & valid[batch_index]] = outcomes[batch_index]
     return result.to(device=turn_ids.device)
+
+
+def normalize_turn_scores(
+    turn_scores: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_end_mask: torch.Tensor,
+    sample_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Normalize one scalar per turn without token-length or copy-padding bias."""
+    if turn_scores.shape != response_mask.shape or turn_end_mask.shape != response_mask.shape:
+        raise ValueError("turn_scores, response_mask, and turn_end_mask must have identical shapes")
+    batch_size = response_mask.shape[0]
+    if sample_weights is None:
+        row_weights = torch.ones(batch_size, device=turn_scores.device, dtype=torch.float32)
+    else:
+        if sample_weights.numel() != batch_size:
+            raise ValueError("sample_weights must contain exactly one value per batch row")
+        row_weights = sample_weights.to(device=turn_scores.device, dtype=torch.float32).reshape(batch_size)
+
+    endpoint_weights = (
+        (turn_end_mask > 0).to(dtype=torch.float32)
+        * (response_mask > 0).to(dtype=torch.float32)
+        * row_weights.unsqueeze(-1)
+    )
+    weight_sum = endpoint_weights.sum()
+    if float(weight_sum.item()) <= 0:
+        return torch.zeros_like(turn_scores)
+    values = turn_scores.float()
+    mean = (values * endpoint_weights).sum() / weight_sum
+    variance = ((values - mean).square() * endpoint_weights).sum() / weight_sum
+    std = variance.sqrt().clamp_min(1e-6)
+    return torch.where(
+        response_mask > 0,
+        (values - mean) / std,
+        torch.zeros_like(values),
+    ).to(dtype=turn_scores.dtype)
 
 
 def trajectory_outcomes(
@@ -1379,6 +1442,12 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             f.write(str(self.global_steps))
 
     def fit(self):
+        try:
+            return self._fit_impl()
+        finally:
+            self._shutdown_frozen_critic()
+
+    def _fit_impl(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -1637,7 +1706,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                     # compute rewards. apply_kl_penalty if available
                     if self.config.algorithm.use_kl_in_reward:
-                        batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty, multi_turn=True)
+                        batch, kl_metrics = apply_kl_penalty(
+                            batch,
+                            kl_ctrl=self.kl_ctrl_in_reward,
+                            kl_penalty=self.config.algorithm.kl_penalty,
+                        )
                         metrics.update(kl_metrics)
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
@@ -1725,6 +1798,8 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                             turn_ids=turn_ids,
                             response_mask=response_mask,
                             mode=outcome_mode,
+                            episode_ids=batch.non_tensor_batch.get("episode_ids", None),
+                            trajectory_turn_ids=batch.non_tensor_batch.get("trajectory_turn_ids", None),
                         )
 
                         label_weight = float(self.config.algorithm.get("label_weight", 1.0))
@@ -1747,7 +1822,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                 kl_component,
                                 turn_ids=turn_ids,
                                 response_mask=response_mask,
-                                reduction="mean",
+                                reduction="sum",
                             )
 
                         endpoint_rewards = place_turn_endpoint_rewards(
@@ -1780,16 +1855,17 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         else:
                             advantages = combined_turn
                             if bool(self.config.algorithm.get("normalize_turn_advantage", False)):
-                                valid_values = advantages[response_mask > 0]
-                                if valid_values.numel() > 1:
-                                    advantages = advantages.clone()
-                                    mean = valid_values.mean()
-                                    std = valid_values.std(unbiased=False).clamp_min(1e-6)
-                                    advantages = torch.where(
-                                        response_mask > 0,
-                                        (advantages - mean) / std,
-                                        torch.zeros_like(advantages),
+                                turn_end_mask = batch.batch.get("turn_end_mask", None)
+                                if turn_end_mask is None:
+                                    raise RuntimeError(
+                                        "normalize_turn_advantage requires turn_end_mask for unbiased turn statistics"
                                     )
+                                advantages = normalize_turn_scores(
+                                    advantages,
+                                    response_mask=response_mask,
+                                    turn_end_mask=turn_end_mask,
+                                    sample_weights=batch.batch.get("sample_weights", None),
+                                )
                             batch.batch["advantages"] = advantages * response_mask
                             batch.batch["returns"] = combined_turn * response_mask
 

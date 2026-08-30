@@ -28,6 +28,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
+from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -151,6 +152,34 @@ def compute_turn_policy_loss(
         cliprange_high=cliprange_high,
         clip_ratio_c=clip_ratio_c,
         loss_agg_mode="token-mean",
+    )
+
+
+def compute_turn_micro_batch_scale(
+    micro_turn_weight: float,
+    global_turn_weight: float,
+    num_mini_batches: int,
+    data_parallel_world_size: int,
+) -> float:
+    """Scale a local weighted-mean loss into the global per-turn objective.
+
+    FSDP averages gradients across data-parallel ranks. Each rank therefore
+    contributes its local weighted turn sum multiplied by ``world_size`` and
+    divided by one fixed per-step normalizer. Keeping that normalizer fixed
+    across mini-batches prevents inverse-weighted padding rows in a short final
+    mini-batch from becoming a full-strength optimizer step again.
+    """
+    if global_turn_weight <= 0:
+        raise ValueError("global_turn_weight must be positive")
+    if num_mini_batches <= 0:
+        raise ValueError("num_mini_batches must be positive")
+    if data_parallel_world_size <= 0:
+        raise ValueError("data_parallel_world_size must be positive")
+    return (
+        float(micro_turn_weight)
+        * float(data_parallel_world_size)
+        * float(num_mini_batches)
+        / float(global_turn_weight)
     )
 
 
@@ -443,6 +472,40 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
+        turn_global_weight = None
+        turn_data_parallel_world_size = 1
+        turn_num_mini_batches = len(dataloader)
+        if "turn_ids" in batch:
+            local_turn_weight = self._count_turns(
+                batch["turn_ids"],
+                sample_weights=batch.get("sample_weights"),
+                response_mask=batch.get("response_mask"),
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                if self.ulysses_sequence_parallel_size != 1:
+                    raise ValueError(
+                        "Turn PPO distributed weighting currently requires "
+                        "ulysses_sequence_parallel_size=1"
+                    )
+                turn_data_parallel_world_size = torch.distributed.get_world_size()
+                device_name = get_device_name()
+                collective_device = (
+                    torch.device(device_name, get_device_id())
+                    if device_name != "cpu"
+                    else torch.device("cpu")
+                )
+                turn_weight_tensor = torch.tensor(
+                    local_turn_weight,
+                    dtype=torch.float64,
+                    device=collective_device,
+                )
+                torch.distributed.all_reduce(turn_weight_tensor, op=torch.distributed.ReduceOp.SUM)
+                turn_global_weight = float(turn_weight_tensor.item())
+            else:
+                turn_global_weight = local_turn_weight
+            if turn_global_weight <= 0 or turn_num_mini_batches <= 0:
+                raise ValueError("Turn PPO received a batch without any valid turn actions")
+
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -546,28 +609,26 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        if turn_ids is not None and mini_batch_turn_weight is not None:
-                            micro_turn_weight = self._count_turns(
-                                turn_ids,
-                                sample_weights=sample_weights,
-                                response_mask=response_mask,
-                            )
-                            loss = policy_loss * (micro_turn_weight / mini_batch_turn_weight)
-                        else:
-                            loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    elif turn_ids is not None and mini_batch_turn_weight is not None:
-                        # compute_turn_policy_loss is a mean over turns. Scale
-                        # each micro-batch by its weighted turn total so
-                        # gradient accumulation is a true weighted mean over
-                        # macro actions, rather than a mean over micro-batches.
+                    if turn_ids is not None and turn_global_weight is not None:
+                        # compute_turn_policy_loss returns a local weighted mean.
+                        # Convert it to a weighted sum, then use one global
+                        # normalizer for every optimizer step in this actor
+                        # update. This remains correct across dynamic
+                        # micro-batches, copied padding rows, and FSDP ranks.
                         micro_turn_weight = self._count_turns(
                             turn_ids,
                             sample_weights=sample_weights,
                             response_mask=response_mask,
                         )
-                        loss = policy_loss * (micro_turn_weight / mini_batch_turn_weight)
+                        loss = policy_loss * compute_turn_micro_batch_scale(
+                            micro_turn_weight=micro_turn_weight,
+                            global_turn_weight=turn_global_weight,
+                            num_mini_batches=turn_num_mini_batches,
+                            data_parallel_world_size=turn_data_parallel_world_size,
+                        )
+                    elif self.config.use_dynamic_bsz:
+                        # relative to the dynamic bsz
+                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()

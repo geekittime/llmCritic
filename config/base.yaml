@@ -106,14 +106,18 @@ generative_critic:
   backend: transformers # transformers | actor_rollout_vllm | deepseek_api
   use_chat_template: True
   model_path: ${model_path}
-  # DeepSeek API critic settings.  Keep the key out of YAML and shell command
-  # lines; export DEEPSEEK_API_KEY in the runtime environment instead.
+  # DeepSeek API critic settings. Keep the key out of YAML and command lines.
+  # The reviewed launcher passes only a mode-600 credential-file path; the Ray
+  # TaskRunner reads its contents after scheduling so Ray job metadata never
+  # contains the key itself. Direct environment injection remains supported for
+  # backwards-compatible local launches.
   # deepseek-chat was deprecated by the provider in July 2026; use the
   # current lower-cost non-thinking Flash endpoint by default.
   deepseek_model: deepseek-v4-flash
   deepseek_api_base: https://api.deepseek.com
   deepseek_api_key_env: DEEPSEEK_API_KEY
   deepseek_api_key: null
+  deepseek_api_key_file: null
   deepseek_thinking: disabled # disabled keeps the short score response deterministic
   deepseek_timeout: 30.0
   # Hard deadline for the complete concurrent judge batch; unfinished turns

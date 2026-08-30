@@ -15,12 +15,64 @@ from ragen.utils import register_resolvers
 register_resolvers()
 import sys
 import socket
+import stat
 from ragen.utils import redact_config
 
 
 # Keep the private name used by the existing launcher/tests while sharing the
 # implementation with the trainer's W&B configuration sanitization.
 _redact_config = redact_config
+
+
+_ALLOWED_CREDENTIAL_NAMES = {"DEEPSEEK_API_KEY", "WANDB_API_KEY"}
+
+
+def _validate_credential_file(path_value):
+    """Validate a credential file without reading secret values in the driver."""
+    if path_value is None or not str(path_value).strip():
+        return None
+    path = os.path.abspath(os.path.expanduser(str(path_value)))
+    file_stat = os.stat(path)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"Credential path is not a regular file: {path}")
+    if file_stat.st_uid != os.getuid():
+        raise PermissionError(f"Credential file must be owned by uid {os.getuid()}: {path}")
+    if stat.S_IMODE(file_stat.st_mode) & 0o077:
+        raise PermissionError(f"Credential file must have mode 600 or stricter: {path}")
+    if not os.access(path, os.R_OK):
+        raise PermissionError(f"Credential file is not readable: {path}")
+    return path
+
+
+def _load_task_credentials(path_value):
+    """Load an allowlisted mode-600 file inside the Ray TaskRunner only."""
+    path = _validate_credential_file(path_value)
+    if path is None:
+        return
+    parsed = {}
+    with open(path, "r", encoding="utf-8") as credential_file:
+        for line_number, raw_line in enumerate(credential_file, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
+            name, separator, value = line.partition("=")
+            name = name.strip()
+            if not separator or name not in _ALLOWED_CREDENTIAL_NAMES:
+                raise ValueError(f"Unsupported credential assignment at {path}:{line_number}")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            if not value:
+                raise ValueError(f"Empty credential value at {path}:{line_number}")
+            parsed[name] = value
+    if "DEEPSEEK_API_KEY" not in parsed and not os.environ.get("DEEPSEEK_API_KEY", "").strip():
+        raise ValueError(f"Credential file does not define DEEPSEEK_API_KEY: {path}")
+    for name, value in parsed.items():
+        # An explicitly selected protected file must override stale inherited
+        # credentials, especially after key rotation.
+        os.environ[name] = value
 
 class DummyRewardManager():
     """The reward manager.
@@ -163,6 +215,25 @@ def add_dependency_and_validate_config(config):
             "algorithm.use_label_outcome_advantage requires agent_proxy.context_window_mode=full "
             "so each sampled turn can retain exact prompt/response token IDs"
         )
+    if use_turn_ppo:
+        critic_enable = config.critic.get("enable", None)
+        value_critic_enabled = bool(critic_enable) or (
+            critic_enable is None and config.algorithm.adv_estimator == "gae"
+        )
+        if value_critic_enabled:
+            raise ValueError(
+                "Exact turn PPO currently requires critic.enable=False: expanded one-turn rows "
+                "cannot run cross-row value GAE without regrouping episode_ids"
+            )
+        if int(config.actor_rollout_ref.actor.ulysses_sequence_parallel_size) != 1:
+            raise ValueError("Exact turn PPO currently requires ulysses_sequence_parallel_size=1")
+        if float(config.actor_rollout_ref.actor.entropy_coeff) != 0.0:
+            raise ValueError("Exact turn PPO currently requires actor entropy_coeff=0")
+        if bool(config.actor_rollout_ref.actor.use_kl_loss):
+            raise ValueError(
+                "Exact turn PPO does not support the token-level actor KL loss; "
+                "use algorithm.use_kl_in_reward with a reference policy instead"
+            )
 
     critic_enabled = bool(config.get("generative_critic", {}).get("enable", False))
     critic_backend = str(config.get("generative_critic", {}).get("backend", "transformers")).lower()
@@ -171,10 +242,18 @@ def add_dependency_and_validate_config(config):
             config.get("generative_critic", {}).get("deepseek_api_key_env", "DEEPSEEK_API_KEY")
         )
         configured_key = config.get("generative_critic", {}).get("deepseek_api_key", None)
-        if not os.environ.get(key_env, "").strip() and not str(configured_key or "").strip():
+        credential_file = _validate_credential_file(
+            config.get("generative_critic", {}).get("deepseek_api_key_file", None)
+        )
+        if (
+            not os.environ.get(key_env, "").strip()
+            and not str(configured_key or "").strip()
+            and credential_file is None
+        ):
             raise RuntimeError(
                 f"DeepSeek critic is enabled but {key_env} is not set. "
-                "Export the key in the launch environment; do not put it in Hydra overrides."
+                "Use a protected deepseek_api_key_file or export the key; "
+                "do not put the value in Hydra overrides."
             )
 
     # add dependency
@@ -200,27 +279,19 @@ def run_ppo(config) -> None:
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
         # this is for local ray cluster
-        # Ray normally inherits the driver's environment, but an explicit
-        # runtime_env (and remote clusters in particular) may not.  Forward
-        # only credentials that are already present in the process environment;
-        # do not put them into the Hydra config or print them in diagnostics.
+        # Never put credentials in runtime_env: Ray exposes it through job
+        # metadata and writes it to runtime-env logs. The reviewed launcher
+        # supplies only a protected file path, read inside TaskRunner.run().
         ray_env_vars = {
             'TOKENIZERS_PARALLELISM': 'true',
             'NCCL_DEBUG': 'WARN',
             'VLLM_LOGGING_LEVEL': 'WARN',
             "RAY_DEBUG": "legacy",  # used here for simpler breakpoint()
         }
-        critic_cfg = config.get("generative_critic", {})
-        critic_backend = str(critic_cfg.get("backend", "transformers")).lower()
-        if critic_backend in {"deepseek", "deepseek_api"}:
-            key_env = str(critic_cfg.get("deepseek_api_key_env", "DEEPSEEK_API_KEY"))
-            if os.environ.get(key_env):
-                ray_env_vars[key_env] = os.environ[key_env]
-        if os.environ.get("WANDB_API_KEY"):
-            ray_env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
-        ray.init(runtime_env={
-            'env_vars': ray_env_vars
-        })
+        ray.init(
+            include_dashboard=False,
+            runtime_env={'env_vars': ray_env_vars},
+        )
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
@@ -235,6 +306,11 @@ class TaskRunner:
         from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
+
+        credential_file = config.get("generative_critic", {}).get(
+            "deepseek_api_key_file", None
+        )
+        _load_task_credentials(credential_file)
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(_redact_config(OmegaConf.to_container(config, resolve=True)))
