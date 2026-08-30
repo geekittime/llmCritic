@@ -89,6 +89,30 @@ def _apply_chat_template_batch(tokenizer, texts: list[str], use_chat_template: b
     return formatted_texts
 
 
+def compose_turn_advantages(
+    label_turn: torch.Tensor,
+    outcome_turn: torch.Tensor,
+    *,
+    mode: str,
+    label_weight: float = 1.0,
+    outcome_weight: float = 1.0,
+) -> torch.Tensor:
+    """Compose the scalar optimized for each sampled macro action."""
+    if label_turn.shape != outcome_turn.shape:
+        raise ValueError(
+            "label_turn and outcome_turn must have the same shape: "
+            f"{tuple(label_turn.shape)} != {tuple(outcome_turn.shape)}"
+        )
+    if mode == "label_only":
+        return label_turn
+    if mode == "weighted":
+        return label_weight * label_turn + outcome_weight * outcome_turn
+    raise ValueError(
+        f"Unsupported algorithm.turn_advantage_mode={mode!r}; "
+        "expected 'weighted' or 'label_only'"
+    )
+
+
 def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> DataProto:
     """
     Adjust batch size to be divisible by size_divisor.
@@ -1716,14 +1740,22 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                     if use_label_outcome_advantage:
-                        # One signed scalar is assigned to each macro action:
-                        #   A_t = w_progress * judge(s_t, a_t, s_{t+1})
-                        #       + w_outcome * {+1 if the episode succeeds,
-                        #                      -1 otherwise}.
+                        # One signed scalar is assigned to each macro action.
+                        # label_only uses the judge output exactly; weighted
+                        # optionally adds the diagnostic terminal outcome.
                         # The actor then sums token log-probabilities inside
                         # that turn, which is exactly the probability product
                         # requested for a turn-level PPO action.
-                        print("[GEN_CRITIC FLOW] using signed turn progress + binary trajectory outcome")
+                        turn_advantage_mode = str(
+                            self.config.algorithm.get("turn_advantage_mode", "weighted")
+                        )
+                        label_weight = float(self.config.algorithm.get("label_weight", 1.0))
+                        outcome_weight = float(self.config.algorithm.get("outcome_weight", 1.0))
+                        print(
+                            "[GEN_CRITIC FLOW] "
+                            f"turn_advantage_mode={turn_advantage_mode} "
+                            f"label_weight={label_weight:g} outcome_weight={outcome_weight:g}"
+                        )
                         response_mask = batch.batch["response_mask"].float()
                         turn_ids = batch.batch.get("turn_ids", None)
                         if turn_ids is None:
@@ -1802,9 +1834,13 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                             trajectory_turn_ids=batch.non_tensor_batch.get("trajectory_turn_ids", None),
                         )
 
-                        label_weight = float(self.config.algorithm.get("label_weight", 1.0))
-                        outcome_weight = float(self.config.algorithm.get("outcome_weight", 1.0))
-                        combined_turn = label_weight * label_turn + outcome_weight * outcome_turn
+                        combined_turn = compose_turn_advantages(
+                            label_turn,
+                            outcome_turn,
+                            mode=turn_advantage_mode,
+                            label_weight=label_weight,
+                            outcome_weight=outcome_weight,
+                        )
 
                         # If KL is configured as a reward penalty, retain its
                         # turn-level contribution instead of silently replacing
@@ -1907,6 +1943,14 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         def weighted_turn_mean(values: torch.Tensor) -> float:
                             return float((values.float() * metric_weights).sum().div(metric_weight_sum).item())
 
+                        def weighted_turn_std(values: torch.Tensor) -> float:
+                            values = values.float()
+                            mean = (values * metric_weights).sum().div(metric_weight_sum)
+                            variance = ((values - mean).square() * metric_weights).sum().div(
+                                metric_weight_sum
+                            )
+                            return float(variance.sqrt().item())
+
                         episode_outcomes = outcomes
                         if "episode_ids" in batch.non_tensor_batch:
                             _, first_indices = np.unique(
@@ -1935,9 +1979,26 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                 "train/label_reward_mean": weighted_turn_mean(label_turn),
                                 "train/outcome_reward_mean": weighted_turn_mean(outcome_turn),
                                 "train/combined_reward_mean": weighted_turn_mean(combined_turn),
+                                "train/combined_reward_std": weighted_turn_std(combined_turn),
+                                "train/label_only_advantage": float(turn_advantage_mode == "label_only"),
+                                "train/label_advantage_weight": (
+                                    1.0 if turn_advantage_mode == "label_only" else label_weight
+                                ),
+                                "train/outcome_advantage_weight": (
+                                    0.0 if turn_advantage_mode == "label_only" else outcome_weight
+                                ),
                                 "train/label_positive_rate": weighted_turn_mean((label_turn > 0).float()),
                                 "train/label_neutral_rate": weighted_turn_mean((label_turn == 0).float()),
                                 "train/label_negative_rate": weighted_turn_mean((label_turn < 0).float()),
+                                "train/advantage_positive_rate": weighted_turn_mean(
+                                    (combined_turn > 0).float()
+                                ),
+                                "train/advantage_neutral_rate": weighted_turn_mean(
+                                    (combined_turn == 0).float()
+                                ),
+                                "train/advantage_negative_rate": weighted_turn_mean(
+                                    (combined_turn < 0).float()
+                                ),
                                 "train/outcome_success_rate": float(
                                     (episode_outcomes > 0).float().mean().item()
                                 ),

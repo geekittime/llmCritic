@@ -11,6 +11,7 @@ from ragen.llm_agent.ctx_manager import build_legacy_turn_metadata, build_turn_t
 from ragen.trainer.agent_trainer import (
     broadcast_outcome_to_turns,
     collapse_turn_scores,
+    compose_turn_advantages,
     normalize_turn_scores,
     place_turn_endpoint_rewards,
     trajectory_outcomes,
@@ -477,8 +478,42 @@ def test_turn_reward_helpers_are_scalar_and_endpoint_based():
     last_turn = broadcast_outcome_to_turns(
         torch.tensor([-1.0]), turn_ids, response_mask, mode="last_turn"
     )
+    no_outcome = broadcast_outcome_to_turns(
+        torch.tensor([1.0]), turn_ids, response_mask, mode="none"
+    )
     assert torch.allclose(all_turns, torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0]]))
     assert torch.allclose(last_turn, torch.tensor([[0.0, 0.0, 0.0, -1.0, -1.0]]))
+    assert torch.count_nonzero(no_outcome) == 0
+
+
+def test_label_only_turn_advantage_is_exact_judge_output():
+    labels = torch.tensor([[1.0, 0.0, -1.0], [-1.0, 1.0, 0.0]])
+    outcomes = torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+
+    advantages = compose_turn_advantages(
+        labels,
+        outcomes,
+        mode="label_only",
+        label_weight=99.0,
+        outcome_weight=99.0,
+    )
+
+    assert torch.equal(advantages, labels)
+
+
+def test_weighted_turn_advantage_keeps_existing_behavior():
+    labels = torch.tensor([[1.0, 0.0, -1.0]])
+    outcomes = torch.tensor([[-1.0, -1.0, -1.0]])
+
+    advantages = compose_turn_advantages(
+        labels,
+        outcomes,
+        mode="weighted",
+        label_weight=2.0,
+        outcome_weight=0.5,
+    )
+
+    assert torch.allclose(advantages, torch.tensor([[1.5, -0.5, -2.5]]))
 
 
 def test_last_turn_outcome_uses_episode_metadata_for_expanded_rows():

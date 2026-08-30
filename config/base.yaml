@@ -89,6 +89,9 @@ algorithm:
   # launchers keep their original token-level advantage behavior.  The
   # DeepSeek launcher enables this explicitly.
   use_label_outcome_advantage: False
+  # weighted: label_weight * process label + outcome_weight * terminal outcome
+  # label_only: use the frozen judge's {-1, 0, 1} label exactly as the turn advantage
+  turn_advantage_mode: weighted # weighted | label_only
   label_weight: 1.0
   outcome_weight: 1.0
   outcome_broadcast: all_turns # all_turns (requested objective) | last_turn | none

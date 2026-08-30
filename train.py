@@ -216,6 +216,35 @@ def add_dependency_and_validate_config(config):
             "so each sampled turn can retain exact prompt/response token IDs"
         )
     if use_turn_ppo:
+        turn_advantage_mode = str(config.algorithm.get("turn_advantage_mode", "weighted"))
+        if turn_advantage_mode not in {"weighted", "label_only"}:
+            raise ValueError(
+                "algorithm.turn_advantage_mode must be 'weighted' or 'label_only', "
+                f"got {turn_advantage_mode!r}"
+            )
+        if turn_advantage_mode == "label_only":
+            if not bool(config.get("generative_critic", {}).get("enable", False)):
+                raise ValueError(
+                    "label_only requires generative_critic.enable=True so the turn "
+                    "advantage comes from a judge"
+                )
+            if str(config.algorithm.get("turn_score_reduction", "mean")) != "mean":
+                raise ValueError(
+                    "label_only requires algorithm.turn_score_reduction=mean so each "
+                    "turn keeps the judge's exact {-1, 0, 1} score"
+                )
+            if bool(config.algorithm.get("normalize_turn_advantage", False)):
+                raise ValueError(
+                    "label_only requires algorithm.normalize_turn_advantage=False so the "
+                    "optimized advantage remains exactly the judge output"
+                )
+            if bool(config.algorithm.use_kl_in_reward) and bool(
+                config.algorithm.get("add_kl_to_turn_advantage", True)
+            ):
+                raise ValueError(
+                    "label_only is incompatible with a KL reward contribution; set "
+                    "algorithm.use_kl_in_reward=False"
+                )
         critic_enable = config.critic.get("enable", None)
         value_critic_enabled = bool(critic_enable) or (
             critic_enable is None and config.algorithm.adv_estimator == "gae"
