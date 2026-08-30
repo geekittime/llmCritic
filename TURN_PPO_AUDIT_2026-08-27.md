@@ -250,3 +250,57 @@ CUDA_DEVICES=0 N_GPUS=1 RUN_NAME=sokoban-turn-ppo-deepseek-v4-flash \
 ### 凭据处置
 
 用户消息中出现过 DeepSeek key，且旧仓库历史曾出现 W&B token。即使工作树已清理，也不能消除 Git 历史或服务端日志中的泄露；在正式运行前应立即吊销并轮换两类凭据，改用临时环境变量/secret manager。
+
+## 2026-08-30 最终复核与远端验证
+
+本节覆盖并取代上文 2026-08-28 的运行状态和测试数字。当前实现 checkpoint 为 `7baeb79`（`fix: harden efficient turn critic training`），分支仍为 `feature/turn-ppo-deepseek-progress`，已推送到 `geekittime/llmCritic`；A100-004 的 `/data/kangshijia/wangbinyu/llm-critic` 已 fast-forward 到相同提交。
+
+### 本轮修复
+
+1. actor 以一次 update 的全局有效 turn 权重作为固定分母，并在 FSDP data-parallel ranks 间 all-reduce；dynamic micro-batch、多 mini-batch 和复制 padding 不再改变每个原始 turn 的总梯度权重。
+2. DeepSeek 对 batch 内所有 unique turn 并发请求，使用持久 event loop/client、Semaphore、批内去重、跨 step LRU、重试和 batch deadline。实际 HTTP 请求数与仅排队后被取消的任务分开统计；恢复后的 429/timeout、空 response 和严格异常路径均有测试。
+3. API batch 在 actor old-log-prob/reward 计算期间由后台线程执行；同一批的所有 turn 并发，训练只在消费 label 时等待。跨线程调用使用 caller-local metadata snapshot，避免 W&B 指标串批；同步桥另有最终 safety deadline。
+4. `last_turn` outcome 使用 `(episode_ids, trajectory_turn_ids)` 找到每条轨迹的真正末 turn；可选 advantage normalization 只在 turn endpoint 上按 sample weights 统计，消除 token 长度和复制 padding 偏差。
+5. exact turn PPO 启动时强制 value critic 关闭、Ulysses SP=1、entropy=0、actor token-KL loss 关闭；尚未正确支持的组合直接 fail fast，不再静默训练错误目标。
+6. Ray 的 `runtime_env` 不再包含 DeepSeek/W&B key。launcher 只把 mode-600 credential-file 路径传给 Hydra，文件内容在 Ray `TaskRunner` 内读取；Ray dashboard 关闭，Ray/cache/temp 父目录权限为 700。凭据文件只允许 `DEEPSEEK_API_KEY` 和 `WANDB_API_KEY`，不会 source 任意 shell，也不会在格式错误时回显原始内容。
+7. launcher 使用短路径 `/data/kangshijia/rt` 避免 Ray Unix socket 超长；TorchInductor、Triton、HF、TMP 和 W&B 文件迁到 `/data`，避免 A100-004 根盘接近满载。它还校验 GPU ID 唯一、确实存在、数量与 Hydra 一致，并拒绝多卡 smoke 的错误 batch 配置。
+8. `train` profile 增加 `CONFIRM_DEEPSEEK_COST=1` 门槛。默认上界可达 `8 * 8 * 5 * 2000 = 640000` 个 turn label（未扣除提前终止/缓存，未计重试），必须先检查 smoke 的 API/parse 指标。
+
+### 验证结果
+
+- 本地 `/home/kangshijia/venvs/ragen/bin/python -m pytest -q tests`：`60 passed`。
+- A100-004 `/home/kangshijia/miniconda3/envs/ragen-vanilla/bin/python -m pytest -q tests`：`60 passed`。
+- 本地及 A100-004：`compileall`、`bash -n`、`git diff --check` 均通过。
+- 本地单卡与两卡配置均通过 `add_dependency_and_validate_config()`；两卡配置保留 `CUDA_VISIBLE_DEVICES='0,1'`，而 `0,0` 和不存在的 GPU ID 会在 shell 阶段拒绝。
+- A100-004 smoke dry-run 解析为：Qwen2.5-3B、1 GPU、`deepseek-v4-flash`、thinking disabled、DeepSeek concurrency 4、`free_cache_engine=True`、logger `console + wandb`。这是配置验证，不是训练结果。
+- 直接从仓库根目录运行无路径限制的 `pytest` 会额外收集 vendored `verl/external` 测试，并因未安装 Prisma、SGLang、Megatron 等可选栈及同机其他仓库的 Python path 冲突而在 collection 失败；本项目维护的 `tests/` 已全量通过。
+
+### 正式实验状态
+
+截至 2026-08-30 15:27（Asia/Singapore），没有启动新的 DeepSeek/W&B 训练 run，也没有可报告的训练曲线。A100-004 八张 GPU 均有其他用户的长期进程：GPU 0--3 各占约 16.4 GB，GPU 4--7 各占约 57.4 GB 且满负载；`~/.config/llm-critic/secrets.env` 也不存在。GPU 0--3 的瞬时利用率为 0 不等于已释放，不能擅自复用。用户消息里曾公开的 DeepSeek key 必须撤销，不能用于实验。
+
+满足以下两个前置条件后，先运行一轮 W&B smoke：
+
+```bash
+ssh A100-004
+cd /data/kangshijia/wangbinyu/llm-critic
+# ~/.config/llm-critic/secrets.env 由用户在终端外安全写入轮换后的 key，chmod 600
+A100004_GPUS_RESERVED=1 CUDA_DEVICES=<明确预留的一张卡> \
+  EXPERIMENT_PROFILE=smoke bash run_a100004_sokoban_turn_ppo.sh
+```
+
+只有在 W&B 中确认 `gen_critic/api_auth_failure_count=0`、`api_failure_rate` 和 `parse_fail_rate` 接近 0、`api_request_count>0`、turn count/ratio/clipfrac 正常后，才运行 `EXPERIMENT_PROFILE=train CONFIRM_DEEPSEEK_COST=1`。
+
+### 最终算法判断
+
+这种方法**可以作为实验性 RL reward shaping 工作，但当前证据不足以断言会提升 Sokoban success**。将完整 response turn 视为 macro action，并用 `sum(token log-prob)` 实现 action probability product，是合法的 turn-MDP PPO ratio；Turn-PPO 原文也给出相同连乘形式。不过当前 `judge + outcome` 是人为指定的直接 advantage，而不是论文中的 learnable value critic + turn-GAE，因此它一般有偏，并且可能改变最优策略。
+
+主要风险是：
+
+- raw product 的 log-ratio 方差随 turn token 数增长，容易整体进入 PPO clip 区；必须对照 geometric-mean ratio。
+- 把 `+1/-1` terminal outcome 加到每个 turn 是用户指定目标，但会重复终局信号；必须对照 `outcome_broadcast=last_turn`。
+- LLM judge 的错误会被策略利用。应先用 Sokoban oracle（箱子到目标距离、死锁检测）构建 golden transitions，报告 `-1/0/1` 混淆矩阵，再比较 oracle progress、DeepSeek progress、terminal-only 和 random judge。
+- 更理论稳健的 shaping 是 potential difference `gamma * Phi(s') - Phi(s)`；绝对标签加 terminal outcome 不具备策略不变保证。
+- exact trace 的每 turn 一行会重复更早的 prefix，长轨迹的 GPU 成本近似二次增长。当前 remove-padding、dynamic batch 和 API/GPU overlap 只能缓解，后续可研究 prefix reuse/packing。
+
+联网复核：Turn-PPO 的 turn action、概率连乘及几何平均讨论见 [Turn-PPO](https://arxiv.org/html/2512.17008)；macro-action 视角见 [MA-RLHF](https://arxiv.org/html/2410.02743)；sequence ratio 长度归一化见 [GSPO](https://arxiv.org/html/2507.18071v2)；progress reward 应近似未来成功概率变化见 [Rewarding Progress](https://arxiv.org/abs/2410.08146)；potential-based shaping 的策略不变条件见 [Ng et al.](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf)。DeepSeek 当前模型、价格和默认 thinking 行为以 [模型列表](https://api-docs.deepseek.com/api/list-models)、[定价](https://api-docs.deepseek.com/quick_start/pricing/) 和 [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/) 为准。
