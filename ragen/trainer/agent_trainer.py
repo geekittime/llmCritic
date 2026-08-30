@@ -5,6 +5,7 @@ Adapted from the excellently written verl implementation.
 
 import os
 import uuid
+import concurrent.futures
 import ray
 import torch
 import numpy as np
@@ -131,7 +132,9 @@ def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> Dat
         adjusted_batch = DataProto(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=batch.meta_info)
 
     elif mode == "copy":
-        # Duplicate samples to make it divisible
+        # Duplicate samples to make it divisible.  Each source row keeps total
+        # optimization weight 1 across its copies, so padding does not
+        # accidentally amplify a randomly selected turn's PPO gradient.
         to_add = size_divisor - remainder
         if to_add > bs:
             dup_indices = np.random.choice(bs, to_add, replace=True)
@@ -144,6 +147,19 @@ def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> Dat
             dup_tensor_data = batch.batch[dup_indices_tensor]
             # Use TensorDict's cat method
             tensor_data = TensorDict.cat([batch.batch, dup_tensor_data], dim=0)
+            source_indices = np.concatenate([np.arange(bs), dup_indices])
+            multiplicity = np.bincount(source_indices, minlength=bs).astype(np.float32)
+            base_weights = (
+                batch.batch["sample_weights"].detach().cpu().numpy().astype(np.float32)
+                if "sample_weights" in batch.batch
+                else np.ones(bs, dtype=np.float32)
+            )
+            adjusted_weights = base_weights[source_indices] / multiplicity[source_indices]
+            tensor_data["sample_weights"] = torch.as_tensor(
+                adjusted_weights,
+                dtype=torch.float32,
+                device=batch.batch.device,
+            )
         else:
             tensor_data = None
 
@@ -490,6 +506,29 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     "[GEN_CRITIC INIT] loaded dedicated critic tokenizer "
                     f"train_model_path={train_model_path} actor_model_path={actor_model_path}"
                 )
+
+        self._frozen_critic_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        if (
+            self.generative_critic.enabled
+            and not self.use_trainable_generative_critic
+            and self.generative_critic.backend in {"deepseek_api", "deepseek"}
+        ):
+            # The API judge is independent of GPU model execution.  A single
+            # background submission lets network latency overlap reward and
+            # old-log-prob computation while preserving one ordered batch.
+            self._frozen_critic_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="deepseek-turn-critic",
+            )
+
+    def _shutdown_frozen_critic(self) -> None:
+        executor = self._frozen_critic_executor
+        self._frozen_critic_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+        close = getattr(self.generative_critic, "close", None)
+        if callable(close):
+            close()
 
     def _generate_with_actor_rollout_vllm(self, prompts: list[str], sampling_overrides: dict) -> list[str]:
         """Reuse actor rollout vLLM engine for generative-critic inference."""
@@ -1372,6 +1411,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_frozen_critic()
                 return
 
         # add tqdm
@@ -1431,6 +1471,8 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             # metrics = {}
             timing_raw = {}
             critic_generation_time = 0.0
+            label_future = None
+            label_future_started = None
 
             batch: DataProto = DataProto()
             is_last_step = self.global_steps >= self.total_training_steps
@@ -1443,6 +1485,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                     # Filter first, then adjust batch size
                     batch, metrics = self.rollout_filter.filter(batch)
+                    original_batch_size = int(batch.batch.batch_size[0])
 
                     # Adjust batch size to be divisible by num_groups, ppo_mini_batch_size, and n_gpus
                     num_groups = self.config.es_manager.train.env_groups
@@ -1456,13 +1499,19 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     batch_size = batch.batch["input_ids"].shape[0]
                     num_mini_batches = batch_size // ppo_mini_batch_size
                     metrics.update({
+                        "train/original_batch_size": original_batch_size,
                         "train/batch_size": batch_size,
                         "train/num_mini_batches": num_mini_batches,
+                        "train/batch_adjust_added": max(batch_size - original_batch_size, 0),
+                        "train/batch_adjust_removed": max(original_batch_size - batch_size, 0),
+                        "train/batch_adjust_fraction": abs(batch_size - original_batch_size)
+                        / max(original_batch_size, 1),
                     })
                     metrics.update({"train/" + key: value for key, value in batch.meta_info["metrics"].items()})
 
-                    inputs, outputs, scores = _process_batch_for_logging(batch)
-                    # self._maybe_log_generations(inputs=inputs, outputs=outputs, scores=scores, _type="train")
+                    # Train generations are decoded only when a logger/dump is
+                    # actually enabled.  Decoding the entire expanded turn
+                    # batch here was otherwise pure per-step CPU overhead.
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # TODO: check if this is correct. Not tested yer
@@ -1507,6 +1556,22 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 # compute global_valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                use_label_outcome_advantage = bool(
+                    self.config.algorithm.get("use_label_outcome_advantage", False)
+                )
+                if (
+                    use_label_outcome_advantage
+                    and self._frozen_critic_executor is not None
+                    and "turn_ids" in batch.batch
+                    and "messages_list" in batch.non_tensor_batch
+                ):
+                    label_future_started = time.perf_counter()
+                    label_future = self._frozen_critic_executor.submit(
+                        self.generative_critic.infer_turn_labels,
+                        batch.non_tensor_batch["messages_list"].tolist(),
+                        batch.batch["turn_ids"].clone(),
+                    )
+
                 if self.use_rm:
                     with marked_timer("reward", timing_raw):
                     # compute reward model score
@@ -1522,13 +1587,18 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                 with marked_timer("old_log_prob", timing_raw, color="blue"):
                     old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                    entropys = old_log_prob.batch["entropys"]
-                    response_masks = batch.batch["response_mask"]
-                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                    entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                    old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                    metrics.update(old_log_prob_metrics)
-                    old_log_prob.batch.pop("entropys")
+                    if "entropys" in old_log_prob.batch:
+                        entropys = old_log_prob.batch["entropys"]
+                        if float(self.config.actor_rollout_ref.actor.entropy_coeff) != 0.0:
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            metrics["actor/entropy"] = entropy_agg.detach().item()
+                        old_log_prob.batch.pop("entropys")
                     batch = batch.union(old_log_prob)
 
                     if "rollout_log_probs" in batch.batch.keys():
@@ -1572,7 +1642,6 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    use_label_outcome_advantage = self.config.algorithm.get("use_label_outcome_advantage", False)
                     if use_label_outcome_advantage:
                         # One signed scalar is assigned to each macro action:
                         #   A_t = w_progress * judge(s_t, a_t, s_{t+1})
@@ -1612,10 +1681,25 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                     )
                                     critic_generation_time += critic_label_gen_time
                                 else:
-                                    label_tensor, label_metrics, _ = self.generative_critic.infer_turn_labels(
-                                        messages_list=messages_list,
-                                        turn_ids=turn_ids,
-                                    )
+                                    if label_future is not None:
+                                        wait_started = time.perf_counter()
+                                        label_tensor, label_metrics, _ = label_future.result()
+                                        wait_time = time.perf_counter() - wait_started
+                                        total_api_time = time.perf_counter() - label_future_started
+                                        metrics.update(
+                                            {
+                                                "timing_s/generative_critic_wait": wait_time,
+                                                "timing_s/generative_critic_overlap": max(
+                                                    total_api_time - wait_time,
+                                                    0.0,
+                                                ),
+                                            }
+                                        )
+                                    else:
+                                        label_tensor, label_metrics, _ = self.generative_critic.infer_turn_labels(
+                                            messages_list=messages_list,
+                                            turn_ids=turn_ids,
+                                        )
                             label_tensor = label_tensor.to(response_mask.device, dtype=torch.float32)
 
                         label_turn = collapse_turn_scores(
@@ -1710,26 +1794,80 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                             batch.batch["returns"] = combined_turn * response_mask
 
                         valid_tokens = response_mask > 0
-                        turn_count = sum(
-                            int(torch.unique(turn_ids[index][valid_tokens[index]]).numel())
-                            for index in range(turn_ids.shape[0])
-                            if torch.any(valid_tokens[index])
-                        )
+                        turn_end_mask = batch.batch.get("turn_end_mask", None)
+                        if turn_end_mask is not None:
+                            metric_turn_mask = (turn_end_mask > 0) & valid_tokens
+                        else:
+                            # Exact traces always provide turn_end_mask.  Keep a
+                            # conservative row endpoint fallback for audited
+                            # legacy batches.
+                            metric_turn_mask = torch.zeros_like(valid_tokens)
+                            valid_rows = torch.any(valid_tokens, dim=-1)
+                            if torch.any(valid_rows):
+                                positions = torch.arange(
+                                    valid_tokens.shape[-1],
+                                    device=valid_tokens.device,
+                                ).unsqueeze(0)
+                                last_positions = torch.where(
+                                    valid_tokens,
+                                    positions,
+                                    torch.zeros_like(positions),
+                                ).max(dim=-1).values
+                                row_indices = torch.nonzero(valid_rows, as_tuple=True)[0]
+                                metric_turn_mask[row_indices, last_positions[row_indices]] = True
+
+                        sample_weights = batch.batch.get("sample_weights", None)
+                        if sample_weights is None:
+                            sample_weights = torch.ones(
+                                turn_ids.shape[0],
+                                dtype=torch.float32,
+                                device=response_mask.device,
+                            )
+                        else:
+                            sample_weights = sample_weights.to(response_mask.device, dtype=torch.float32)
+                        metric_weights = metric_turn_mask.float() * sample_weights.unsqueeze(-1)
+                        metric_weight_sum = metric_weights.sum().clamp_min(1.0)
+
+                        def weighted_turn_mean(values: torch.Tensor) -> float:
+                            return float((values.float() * metric_weights).sum().div(metric_weight_sum).item())
+
+                        episode_outcomes = outcomes
+                        if "episode_ids" in batch.non_tensor_batch:
+                            _, first_indices = np.unique(
+                                batch.non_tensor_batch["episode_ids"],
+                                return_index=True,
+                            )
+                            episode_outcomes = outcomes[
+                                torch.as_tensor(
+                                    first_indices,
+                                    dtype=torch.long,
+                                    device=outcomes.device,
+                                )
+                            ]
+
+                        turn_lengths = response_mask.sum(dim=-1).float()
+                        weighted_turn_count = float(metric_weights.sum().item())
                         metrics.update(label_metrics)
                         metrics.update(
                             {
-                                "train/turn_count": float(turn_count),
-                                "train/label_reward_mean": float(label_turn[valid_tokens].mean().item())
-                                if torch.any(valid_tokens)
-                                else 0.0,
-                                "train/outcome_reward_mean": float(outcome_turn[valid_tokens].mean().item())
-                                if torch.any(valid_tokens)
-                                else 0.0,
-                                "train/combined_reward_mean": float(combined_turn[valid_tokens].mean().item())
-                                if torch.any(valid_tokens)
-                                else 0.0,
-                                "train/outcome_success_rate": float((outcomes > 0).float().mean().item()),
-                                "train/outcome_failure_rate": float((outcomes < 0).float().mean().item()),
+                                "train/turn_count": weighted_turn_count,
+                                "train/expanded_turn_count": float(metric_turn_mask.sum().item()),
+                                "train/turn_length_mean": float(
+                                    (turn_lengths * sample_weights).sum().div(sample_weights.sum().clamp_min(1.0)).item()
+                                ),
+                                "train/turn_length_p95": float(torch.quantile(turn_lengths, 0.95).item()),
+                                "train/label_reward_mean": weighted_turn_mean(label_turn),
+                                "train/outcome_reward_mean": weighted_turn_mean(outcome_turn),
+                                "train/combined_reward_mean": weighted_turn_mean(combined_turn),
+                                "train/label_positive_rate": weighted_turn_mean((label_turn > 0).float()),
+                                "train/label_neutral_rate": weighted_turn_mean((label_turn == 0).float()),
+                                "train/label_negative_rate": weighted_turn_mean((label_turn < 0).float()),
+                                "train/outcome_success_rate": float(
+                                    (episode_outcomes > 0).float().mean().item()
+                                ),
+                                "train/outcome_failure_rate": float(
+                                    (episode_outcomes < 0).float().mean().item()
+                                ),
                                 "train/outcome_source_missing": float(outcome_source == "missing"),
                                 "train/outcome_source_trajectory_success": float(
                                     outcome_source == "trajectory_success"
@@ -1831,6 +1969,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             if is_last_step:
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
+                self._shutdown_frozen_critic()
                 return
 
             progress_bar.update(1)

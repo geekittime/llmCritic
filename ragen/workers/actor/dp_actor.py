@@ -54,46 +54,92 @@ def compute_turn_policy_loss(
     cliprange_low: float,
     cliprange_high: float,
     clip_ratio_c: float,
+    sample_weights: torch.Tensor = None,
 ):
     if old_log_prob.shape != log_prob.shape or old_log_prob.shape != response_mask.shape:
         raise ValueError("old_log_prob, log_prob, and response_mask must have identical shapes")
     if turn_ids.shape != response_mask.shape or advantages.shape != response_mask.shape:
         raise ValueError("turn_ids and advantages must be aligned with response_mask")
 
-    turn_old_log_prob = []
-    turn_log_prob = []
-    turn_advantages = []
+    batch_size, response_length = turn_ids.shape
+    if sample_weights is None:
+        row_weights = torch.ones(batch_size, device=log_prob.device, dtype=torch.float32)
+    else:
+        if sample_weights.numel() != batch_size:
+            raise ValueError("sample_weights must contain exactly one value per batch row")
+        row_weights = sample_weights.to(device=log_prob.device, dtype=torch.float32).reshape(batch_size)
 
-    for b in range(turn_ids.size(0)):
-        valid_turn_ids = torch.unique(turn_ids[b][turn_ids[b] >= 0], sorted=True)
-        for tid in valid_turn_ids:
-            token_mask = (turn_ids[b] == tid) & (response_mask[b] > 0)
-            if not torch.any(token_mask):
-                continue
-
-            token_indices = torch.nonzero(token_mask, as_tuple=True)[0]
-            # Advantages may be stored only at the turn endpoint (the scalar
-            # reward convention); use the last sampled token so both endpoint
-            # and broadcast GAE representations are supported.
-            turn_advantage = advantages[b, token_indices[-1]]
-            turn_old_log_prob.append(old_log_prob[b][token_mask].sum())
-            turn_log_prob.append(log_prob[b][token_mask].sum())
-            turn_advantages.append(turn_advantage)
-
-    if len(turn_log_prob) == 0:
+    token_mask = (turn_ids >= 0) & (response_mask > 0)
+    if token_mask.numel() == 0:
         zero = torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype)
         return zero, zero, zero, zero
 
-    turn_old_log_prob = torch.stack(turn_old_log_prob)
-    turn_log_prob = torch.stack(turn_log_prob)
-    turn_advantages = torch.stack(turn_advantages)
+    has_turn = token_mask.any(dim=-1)
+    has_any_turn, is_exact_single_turn_trace = torch.stack(
+        (has_turn.any(), ((turn_ids == 0) | ~token_mask).all())
+    ).tolist()
+    if not has_any_turn:
+        zero = torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype)
+        return zero, zero, zero, zero
+
+    if is_exact_single_turn_trace:
+        # build_turn_token_metadata assigns id 0 to the sole macro action in
+        # every exact-trace row. Keep this path dense so it has no Python loop
+        # or per-row device sync.
+        turn_old_log_prob = torch.where(token_mask, old_log_prob, 0.0).sum(dim=-1)
+        turn_log_prob = torch.where(token_mask, log_prob, 0.0).sum(dim=-1)
+        token_positions = torch.arange(response_length, device=turn_ids.device).unsqueeze(0)
+        last_token_position = torch.where(token_mask, token_positions, -1).amax(dim=-1).clamp_min(0)
+        turn_advantages = advantages.gather(1, last_token_position.unsqueeze(-1)).squeeze(-1)
+        turn_weights = row_weights * has_turn.to(row_weights.dtype)
+    else:
+        # A row may contain several turns. Group by (batch row, turn id), sum
+        # token log-probabilities per macro action, and gather its last token's
+        # advantage. All grouping remains on device.
+        token_indices = torch.nonzero(token_mask, as_tuple=False)
+        turn_pairs = torch.stack(
+            (token_indices[:, 0], turn_ids[token_mask]),
+            dim=-1,
+        )
+        unique_turn_pairs, inverse = torch.unique(
+            turn_pairs,
+            sorted=True,
+            return_inverse=True,
+            dim=0,
+        )
+        num_turns = unique_turn_pairs.size(0)
+
+        turn_old_log_prob = old_log_prob.new_zeros(num_turns)
+        turn_old_log_prob.scatter_add_(0, inverse, old_log_prob[token_mask])
+        turn_log_prob = log_prob.new_zeros(num_turns)
+        turn_log_prob.scatter_add_(0, inverse, log_prob[token_mask])
+
+        last_token_position = torch.full(
+            (num_turns,),
+            -1,
+            dtype=torch.long,
+            device=turn_ids.device,
+        )
+        last_token_position.scatter_reduce_(
+            0,
+            inverse,
+            token_indices[:, 1],
+            reduce="amax",
+            include_self=True,
+        )
+        turn_advantages = advantages[
+            unique_turn_pairs[:, 0],
+            last_token_position,
+        ]
+        turn_weights = row_weights[unique_turn_pairs[:, 0]]
 
     # Reuse the existing PPO implementation with turn-level packed tensors.
-    # Shape as (num_turns, 1), with mask=1 to keep code path aligned.
+    # A numeric mask applies each row's sample weight to all of its turns and
+    # normalizes the objective by the weighted number of macro actions.
     turn_old_log_prob = turn_old_log_prob.unsqueeze(-1)
     turn_log_prob = turn_log_prob.unsqueeze(-1)
     turn_advantages = turn_advantages.unsqueeze(-1)
-    turn_mask = torch.ones_like(turn_advantages)
+    turn_mask = turn_weights.unsqueeze(-1)
 
     return compute_policy_loss(
         old_log_prob=turn_old_log_prob,
@@ -240,10 +286,46 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @staticmethod
-    def _count_turns(turn_ids: torch.Tensor) -> int:
+    def _count_turns(
+        turn_ids: torch.Tensor,
+        sample_weights: torch.Tensor = None,
+        response_mask: torch.Tensor = None,
+    ) -> float:
         if turn_ids.numel() == 0:
-            return 0
-        return sum(int(torch.unique(row[row >= 0]).numel()) for row in turn_ids)
+            return 0.0
+        if response_mask is not None and response_mask.shape != turn_ids.shape:
+            raise ValueError("response_mask must have the same shape as turn_ids")
+
+        batch_size = turn_ids.size(0)
+        if sample_weights is None:
+            row_weights = torch.ones(batch_size, device=turn_ids.device, dtype=torch.float32)
+        else:
+            if sample_weights.numel() != batch_size:
+                raise ValueError("sample_weights must contain exactly one value per batch row")
+            row_weights = sample_weights.to(device=turn_ids.device, dtype=torch.float32).reshape(batch_size)
+
+        token_mask = turn_ids >= 0
+        if response_mask is not None:
+            token_mask = token_mask & (response_mask > 0)
+
+        has_turn = token_mask.any(dim=-1)
+        is_exact_single_turn_trace = ((turn_ids == 0) | ~token_mask).all()
+
+        if bool(is_exact_single_turn_trace):
+            total_weight = (row_weights * has_turn.to(row_weights.dtype)).sum()
+        else:
+            token_indices = torch.nonzero(token_mask, as_tuple=False)
+            turn_pairs = torch.stack(
+                (token_indices[:, 0], turn_ids[token_mask]),
+                dim=-1,
+            )
+            unique_turn_pairs = torch.unique(turn_pairs, sorted=True, dim=0)
+            total_weight = row_weights[unique_turn_pairs[:, 0]].sum()
+
+        # update_policy needs a host scalar for its empty-batch guard and
+        # micro-batch accumulation factor. This is one synchronization per
+        # batch, rather than one synchronization per row/turn.
+        return float(total_weight.item())
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False, no_lora=False) -> torch.Tensor:
@@ -293,16 +375,25 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_module.merge_adapter()
             print(f"[INFO] Merged adapter actor")
 
+        # Some upstream worker versions request an entropy tensor
+        # unconditionally. With a zero entropy coefficient, retain that
+        # contract using a zero placeholder and skip the expensive
+        # full-vocabulary entropy reduction.
+        compute_entropy = calculate_entropy and self.config.entropy_coeff != 0
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, log_probs = self._forward_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=compute_entropy,
+                )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
-                entropy_lst.append(entropy)
+                entropy_lst.append(entropy if compute_entropy else torch.zeros_like(log_probs))
 
         log_probs = torch.concat(log_probs_lst, dim=0)
 
@@ -321,6 +412,8 @@ class DataParallelPPOActor(BasePPOActor):
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
+            if entropys is not None:
+                entropys = entropys[revert_indices]
 
         return log_probs, entropys
 
@@ -334,6 +427,8 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "response_mask"]
         if "turn_ids" in data.batch:
             select_keys.append("turn_ids")
+        if "sample_weights" in data.batch:
+            select_keys.append("sample_weights")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
@@ -366,15 +461,16 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
-                mini_batch_turn_count = None
-                mini_batch_turn_ids = (
-                    mini_batch.batch.get("turn_ids")
-                    if isinstance(mini_batch, DataProto)
-                    else mini_batch.get("turn_ids")
-                )
+                mini_batch_turn_weight = None
+                mini_batch_values = mini_batch.batch if isinstance(mini_batch, DataProto) else mini_batch
+                mini_batch_turn_ids = mini_batch_values.get("turn_ids")
                 if mini_batch_turn_ids is not None:
-                    mini_batch_turn_count = self._count_turns(mini_batch_turn_ids)
-                    if mini_batch_turn_count <= 0:
+                    mini_batch_turn_weight = self._count_turns(
+                        mini_batch_turn_ids,
+                        sample_weights=mini_batch_values.get("sample_weights"),
+                        response_mask=mini_batch_values.get("response_mask"),
+                    )
+                    if mini_batch_turn_weight <= 0:
                         raise ValueError("Turn PPO received a mini-batch without any valid turn actions")
 
                 for data in micro_batches:
@@ -391,6 +487,7 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
                     turn_ids = data.get("turn_ids", None)
+                    sample_weights = data.get("sample_weights", None)
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -416,6 +513,7 @@ class DataParallelPPOActor(BasePPOActor):
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
                             clip_ratio_c=clip_ratio_c,
+                            sample_weights=sample_weights,
                         )
                     else:
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
@@ -450,18 +548,26 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        if turn_ids is not None and mini_batch_turn_count is not None:
-                            micro_turn_count = self._count_turns(turn_ids)
-                            loss = policy_loss * (micro_turn_count / mini_batch_turn_count)
+                        if turn_ids is not None and mini_batch_turn_weight is not None:
+                            micro_turn_weight = self._count_turns(
+                                turn_ids,
+                                sample_weights=sample_weights,
+                                response_mask=response_mask,
+                            )
+                            loss = policy_loss * (micro_turn_weight / mini_batch_turn_weight)
                         else:
                             loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    elif turn_ids is not None and mini_batch_turn_count is not None:
+                    elif turn_ids is not None and mini_batch_turn_weight is not None:
                         # compute_turn_policy_loss is a mean over turns. Scale
-                        # each micro-batch by its turn count so gradient
-                        # accumulation is a true mean over macro actions,
-                        # rather than a mean over micro-batches.
-                        micro_turn_count = self._count_turns(turn_ids)
-                        loss = policy_loss * (micro_turn_count / mini_batch_turn_count)
+                        # each micro-batch by its weighted turn total so
+                        # gradient accumulation is a true weighted mean over
+                        # macro actions, rather than a mean over micro-batches.
+                        micro_turn_weight = self._count_turns(
+                            turn_ids,
+                            sample_weights=sample_weights,
+                            response_mask=response_mask,
+                        )
+                        loss = policy_loss * (micro_turn_weight / mini_batch_turn_weight)
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()

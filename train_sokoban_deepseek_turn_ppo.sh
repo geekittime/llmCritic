@@ -10,32 +10,82 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
+# Optionally load credentials from a caller-owned, mode-600 file.  This keeps
+# secrets out of Hydra overrides, process listings, the repository, and W&B.
+if [[ -n "${SECRETS_FILE:-}" ]]; then
+    if [[ ! -r "${SECRETS_FILE}" ]]; then
+        echo "Secrets file is not readable: ${SECRETS_FILE}" >&2
+        exit 2
+    fi
+    secrets_mode="$(stat -c '%a' "${SECRETS_FILE}")"
+    if (( (8#${secrets_mode}) & 077 )); then
+        echo "Secrets file must not be accessible by group/other: ${SECRETS_FILE}" >&2
+        exit 2
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "${SECRETS_FILE}"
+    set +a
+fi
+
 : "${DEEPSEEK_API_KEY:?Set DEEPSEEK_API_KEY in the environment before starting the run}"
 
 export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARN}"
-export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray-${USER:-ragen}}"
+RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
+safe_run_name="$(printf '%s' "${RUN_NAME}" | tr -c 'A-Za-z0-9_.-' '_')"
+if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
+    default_ray_tmp="/data/${USER}/ray/llm-critic-${safe_run_name}"
+else
+    default_ray_tmp="/tmp/ray-${USER:-ragen}-${safe_run_name}"
+fi
+export RAY_TMPDIR="${RAY_TMPDIR:-${default_ray_tmp}}"
 mkdir -p "${RAY_TMPDIR}"
 
-# W&B uses WANDB_API_KEY when online and does not need a login command.  An
-# absent W&B key intentionally falls back to offline logs, which can be synced
-# later with `wandb sync`; no credential is embedded in this script.
+# W&B can authenticate through WANDB_API_KEY or a mode-600 ~/.netrc.  Callers
+# can always force WANDB_MODE=online/offline; no credential is embedded here.
 export WANDB_ENTITY="${WANDB_ENTITY:-MuLab-RL}"
 export WANDB_PROJECT="${WANDB_PROJECT:-llm-critic-turn-ppo}"
-export WANDB_MODE="${WANDB_MODE:-$([[ -n "${WANDB_API_KEY:-}" ]] && echo online || echo offline)}"
+if [[ -z "${WANDB_MODE:-}" ]]; then
+    if [[ -n "${WANDB_API_KEY:-}" ]] || { [[ -r "${HOME}/.netrc" ]] && grep -q 'api\.wandb\.ai' "${HOME}/.netrc"; }; then
+        WANDB_MODE=online
+    else
+        WANDB_MODE=offline
+    fi
+fi
+export WANDB_MODE
 export WANDB_DIR="${WANDB_DIR:-${RAY_TMPDIR}/wandb}"
 mkdir -p "${WANDB_DIR}"
 
-if [[ -x /home/kangshijia/venvs/ragen/bin/python ]]; then
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+    if [[ ! -x "${PYTHON_BIN}" ]]; then
+        echo "PYTHON_BIN is not executable: ${PYTHON_BIN}" >&2
+        exit 2
+    fi
+    PYTHON_CMD=("${PYTHON_BIN}")
+elif [[ -x /home/kangshijia/venvs/ragen/bin/python ]]; then
     PYTHON_CMD=(/home/kangshijia/venvs/ragen/bin/python)
+elif [[ -x /home/kangshijia/miniconda3/envs/ragen-vanilla/bin/python ]]; then
+    PYTHON_CMD=(/home/kangshijia/miniconda3/envs/ragen-vanilla/bin/python)
 elif command -v conda >/dev/null 2>&1; then
-    PYTHON_CMD=(conda run --no-capture-output -n ragen python)
+    PYTHON_CMD=(conda run --no-capture-output -n "${RAGEN_CONDA_ENV:-ragen}" python)
 else
     PYTHON_CMD=(python)
 fi
 
-MODEL_PATH="${MODEL_PATH:-/data/kangshijia/sicheng/AgentGym-RL/models/Qwen2.5-3B-Instruct}"
+if [[ -z "${MODEL_PATH:-}" ]]; then
+    for candidate in \
+        /data/models/Qwen2.5-3B-Instruct \
+        /data/kangshijia/models/Qwen2.5-3B-instruct \
+        /data/kangshijia/sicheng/AgentGym-RL/models/Qwen2.5-3B-Instruct; do
+        if [[ -f "${candidate}/config.json" ]]; then
+            MODEL_PATH="${candidate}"
+            break
+        fi
+    done
+fi
+MODEL_PATH="${MODEL_PATH:-/data/models/Qwen2.5-3B-Instruct}"
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
     echo "Model config not found: ${MODEL_PATH}/config.json" >&2
     echo "Set MODEL_PATH to a local Qwen2/Qwen3 checkpoint." >&2
@@ -53,7 +103,6 @@ if [[ "${N_GPUS}" -ne "${#GPU_IDS[@]}" ]]; then
     exit 2
 fi
 
-RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
 PROJECT_NAME="${WANDB_PROJECT}"
 
 # Keep defaults modest enough for a first validation run.  Increase the group
@@ -94,9 +143,18 @@ TRAIN_ARGS=(
     "algorithm.label_weight=1.0"
     "algorithm.outcome_weight=1.0"
     "actor_rollout_ref.actor.use_ref=False"
+    "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF:-0.0}"
+    "actor_rollout_ref.actor.ppo_epochs=${PPO_EPOCHS:-1}"
+    "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ:-True}"
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
+    "actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD:-False}"
+    "actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIMIZER_OFFLOAD:-False}"
+    "actor_rollout_ref.model.use_remove_padding=${USE_REMOVE_PADDING:-True}"
     "actor_rollout_ref.rollout.rollout_filter_ratio=1.0"
     "actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
+    "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ:-True}"
+    "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
     "generative_critic.enable=True"
     "generative_critic.train_enable=False"
     "generative_critic.backend=deepseek_api"
@@ -104,10 +162,11 @@ TRAIN_ARGS=(
     "generative_critic.deepseek_model=${DEEPSEEK_MODEL}"
     "generative_critic.deepseek_api_key_env=DEEPSEEK_API_KEY"
     "generative_critic.deepseek_thinking=${DEEPSEEK_THINKING:-disabled}"
-    "generative_critic.deepseek_timeout=${DEEPSEEK_TIMEOUT:-30}"
-    "generative_critic.deepseek_max_retries=${DEEPSEEK_MAX_RETRIES:-2}"
+    "generative_critic.deepseek_timeout=${DEEPSEEK_TIMEOUT:-15}"
+    "generative_critic.deepseek_batch_timeout=${DEEPSEEK_BATCH_TIMEOUT:-120}"
+    "generative_critic.deepseek_max_retries=${DEEPSEEK_MAX_RETRIES:-1}"
     "generative_critic.deepseek_max_concurrency=${DEEPSEEK_MAX_CONCURRENCY:-16}"
-    "generative_critic.deepseek_max_tokens=${DEEPSEEK_MAX_TOKENS:-16}"
+    "generative_critic.deepseek_max_tokens=${DEEPSEEK_MAX_TOKENS:-8}"
     "generative_critic.deepseek_max_prompt_chars=${DEEPSEEK_MAX_PROMPT_CHARS:-12000}"
     "generative_critic.parse_fail_score=-1"
     "generative_critic.default_label_if_parse_fail=False"

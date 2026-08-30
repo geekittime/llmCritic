@@ -116,6 +116,9 @@ generative_critic:
   deepseek_api_key: null
   deepseek_thinking: disabled # disabled keeps the short score response deterministic
   deepseek_timeout: 30.0
+  # Hard deadline for the complete concurrent judge batch; unfinished turns
+  # follow the required -1 failure policy instead of stalling a PPO step.
+  deepseek_batch_timeout: 120.0
   deepseek_max_retries: 2
   deepseek_max_concurrency: 16
   deepseek_max_tokens: 32

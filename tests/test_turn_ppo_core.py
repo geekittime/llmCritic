@@ -1,8 +1,10 @@
 import inspect
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import torch
+from verl import DataProto
+from verl.trainer.ppo.core_algos import compute_policy_loss
 
 from ragen.llm_agent.ctx_manager import build_legacy_turn_metadata, build_turn_token_metadata
 from ragen.trainer.agent_trainer import (
@@ -12,7 +14,7 @@ from ragen.trainer.agent_trainer import (
     trajectory_outcomes,
 )
 from ragen.trainer.core_algos import compute_turn_gae_advantage_return
-from ragen.workers.actor.dp_actor import compute_turn_policy_loss
+from ragen.workers.actor.dp_actor import DataParallelPPOActor, compute_turn_policy_loss
 from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
 from ragen.utils import redact_config
 
@@ -126,6 +128,263 @@ def test_macro_ratio_sums_token_log_probabilities():
     )
     expected = -(2 * torch.exp(torch.tensor(0.3)) + 3 * torch.exp(torch.tensor(0.2))) / 2
     assert torch.allclose(loss, expected)
+
+
+def _reference_turn_policy_loss(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    turn_ids,
+    sample_weights=None,
+):
+    packed_old_log_prob = []
+    packed_log_prob = []
+    packed_advantages = []
+    packed_weights = []
+    if sample_weights is None:
+        sample_weights = torch.ones(turn_ids.size(0), dtype=log_prob.dtype)
+
+    for row in range(turn_ids.size(0)):
+        for turn_id in torch.unique(turn_ids[row][turn_ids[row] >= 0], sorted=True):
+            token_mask = (turn_ids[row] == turn_id) & (response_mask[row] > 0)
+            if not torch.any(token_mask):
+                continue
+            token_indices = torch.nonzero(token_mask, as_tuple=True)[0]
+            packed_old_log_prob.append(old_log_prob[row][token_mask].sum())
+            packed_log_prob.append(log_prob[row][token_mask].sum())
+            packed_advantages.append(advantages[row, token_indices[-1]])
+            packed_weights.append(sample_weights[row])
+
+    if not packed_log_prob:
+        zero = log_prob.new_tensor(0.0)
+        return zero, zero, zero, zero
+
+    return compute_policy_loss(
+        old_log_prob=torch.stack(packed_old_log_prob).unsqueeze(-1),
+        log_prob=torch.stack(packed_log_prob).unsqueeze(-1),
+        advantages=torch.stack(packed_advantages).unsqueeze(-1),
+        response_mask=torch.stack(packed_weights).unsqueeze(-1),
+        cliprange=0.2,
+        cliprange_low=0.1,
+        cliprange_high=0.3,
+        clip_ratio_c=3.0,
+        loss_agg_mode="token-mean",
+    )
+
+
+def test_vectorized_single_turn_path_handles_padding_and_empty_rows():
+    old_log_prob = torch.zeros((3, 4))
+    log_prob = torch.tensor(
+        [
+            [0.1, 99.0, 0.2, 99.0],
+            [99.0, 99.0, 99.0, 99.0],
+            [0.1, 99.0, 0.3, 99.0],
+        ]
+    )
+    advantages = torch.tensor(
+        [
+            [10.0, 10.0, 2.0, 10.0],
+            [10.0, 10.0, 10.0, 10.0],
+            [10.0, 10.0, 4.0, 10.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    turn_ids = torch.tensor(
+        [
+            [0, -1, 0, -1],
+            [-1, -1, -1, -1],
+            [0, 0, 0, -1],
+        ]
+    )
+
+    actual = compute_turn_policy_loss(
+        old_log_prob,
+        log_prob,
+        advantages,
+        response_mask,
+        turn_ids,
+        cliprange=0.2,
+        cliprange_low=0.1,
+        cliprange_high=0.3,
+        clip_ratio_c=3.0,
+    )
+    expected = _reference_turn_policy_loss(
+        old_log_prob,
+        log_prob,
+        advantages,
+        response_mask,
+        turn_ids,
+    )
+
+    assert all(torch.allclose(got, want) for got, want in zip(actual, expected))
+    assert DataParallelPPOActor._count_turns(turn_ids, response_mask=response_mask) == 2.0
+
+
+def test_turn_policy_loss_returns_zero_for_all_padding_rows():
+    shape = (2, 3)
+    outputs = compute_turn_policy_loss(
+        torch.full(shape, float("nan")),
+        torch.full(shape, float("nan")),
+        torch.full(shape, float("nan")),
+        torch.zeros(shape),
+        torch.full(shape, -1),
+        cliprange=0.2,
+        cliprange_low=0.1,
+        cliprange_high=0.3,
+        clip_ratio_c=3.0,
+    )
+
+    assert all(output.item() == 0.0 for output in outputs)
+    assert DataParallelPPOActor._count_turns(torch.full(shape, -1)) == 0.0
+
+
+def test_vectorized_multi_turn_path_matches_reference_with_row_weights():
+    old_log_prob = torch.tensor(
+        [
+            [0.0, -0.1, 9.0, 0.2, 0.0, -0.2, 9.0],
+            [9.0, 0.1, -0.4, 0.0, 9.0, 0.3, -0.1],
+            [9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+        ]
+    )
+    log_prob = old_log_prob + torch.tensor(
+        [
+            [0.05, 0.02, 8.0, -0.03, 0.01, 0.04, 8.0],
+            [8.0, -0.02, 0.05, 0.03, 8.0, -0.01, 0.02],
+            [8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0],
+        ]
+    )
+    advantages = torch.tensor(
+        [
+            [1.0, 2.0, 0.0, -1.0, -2.0, 3.0, 0.0],
+            [0.0, 4.0, 99.0, -3.0, 0.0, -2.0, -5.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    # Turn 2 reappears after turn 7, exercising grouping by id rather than
+    # assuming each id occupies exactly one contiguous run.
+    turn_ids = torch.tensor(
+        [
+            [2, 2, -1, 7, 7, 2, -1],
+            [-1, 4, 4, 9, -1, 9, 9],
+            [-1, -1, -1, -1, -1, -1, -1],
+        ]
+    )
+    sample_weights = torch.tensor([0.25, 2.0, 10.0])
+
+    actual = compute_turn_policy_loss(
+        old_log_prob,
+        log_prob,
+        advantages,
+        response_mask,
+        turn_ids,
+        cliprange=0.2,
+        cliprange_low=0.1,
+        cliprange_high=0.3,
+        clip_ratio_c=3.0,
+        sample_weights=sample_weights,
+    )
+    expected = _reference_turn_policy_loss(
+        old_log_prob,
+        log_prob,
+        advantages,
+        response_mask,
+        turn_ids,
+        sample_weights=sample_weights,
+    )
+
+    assert all(torch.allclose(got, want) for got, want in zip(actual, expected))
+    assert DataParallelPPOActor._count_turns(
+        turn_ids,
+        sample_weights=sample_weights,
+        response_mask=response_mask,
+    ) == 4.5
+
+
+def test_inverse_multiplicity_weights_remove_copied_row_bias():
+    original_log_prob = torch.tensor([[0.1, 0.2], [-0.2, 0.1]])
+    original_advantages = torch.tensor([[1.0, 2.0], [-1.0, 3.0]])
+    original_turn_ids = torch.tensor([[0, 0], [0, 0]])
+    original_mask = torch.ones_like(original_log_prob)
+
+    original = compute_turn_policy_loss(
+        torch.zeros_like(original_log_prob),
+        original_log_prob,
+        original_advantages,
+        original_mask,
+        original_turn_ids,
+        cliprange=10.0,
+        cliprange_low=10.0,
+        cliprange_high=10.0,
+        clip_ratio_c=3.0,
+    )[0]
+
+    copied_rows = torch.tensor([0, 0, 1])
+    copied = compute_turn_policy_loss(
+        torch.zeros_like(original_log_prob[copied_rows]),
+        original_log_prob[copied_rows],
+        original_advantages[copied_rows],
+        original_mask[copied_rows],
+        original_turn_ids[copied_rows],
+        cliprange=10.0,
+        cliprange_low=10.0,
+        cliprange_high=10.0,
+        clip_ratio_c=3.0,
+        sample_weights=torch.tensor([0.5, 0.5, 1.0]),
+    )[0]
+
+    assert torch.allclose(copied, original)
+
+
+def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction():
+    actor = object.__new__(DataParallelPPOActor)
+    actor.config = SimpleNamespace(entropy_coeff=0.0)
+    actor.ulysses_sequence_parallel_size = 1
+    actor.actor_module = SimpleNamespace(
+        _fsdp_wrapped_module=object(),
+        eval=lambda: None,
+    )
+    entropy_requests = []
+
+    def fake_forward(self, micro_batch, temperature, calculate_entropy=False):
+        entropy_requests.append(calculate_entropy)
+        log_probs = micro_batch["responses"].float() / temperature
+        return None, log_probs
+
+    actor._forward_micro_batch = MethodType(fake_forward, actor)
+    responses = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    data = DataProto.from_dict(
+        tensors={
+            "responses": responses,
+            "input_ids": responses,
+            "attention_mask": torch.ones_like(responses),
+            "position_ids": torch.arange(3).expand_as(responses),
+        },
+        meta_info={
+            "micro_batch_size": 1,
+            "temperature": 2.0,
+            "use_dynamic_bsz": False,
+        },
+    )
+
+    log_probs, entropys = actor.compute_log_prob(data, calculate_entropy=True)
+
+    assert entropy_requests == [False, False]
+    assert torch.equal(log_probs, responses.float() / 2.0)
+    assert torch.equal(entropys, torch.zeros_like(log_probs))
 
 
 def test_turn_reward_helpers_are_scalar_and_endpoint_based():

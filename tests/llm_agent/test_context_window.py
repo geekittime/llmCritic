@@ -1,7 +1,7 @@
 import pytest
 from ragen.llm_agent.ctx_manager import ContextManager
 from omegaconf import OmegaConf
-from verl.verl.protocol import DataProto
+from verl.protocol import DataProto
 
 class DummyTokenizer:
     name_or_path = "qwen"  # or "llama-3" or any string your code expects
@@ -11,9 +11,10 @@ class DummyTokenizer:
 
     def __call__(self, texts, return_tensors, padding, padding_side, truncation):
         import torch
+        batch_size = len(texts) if isinstance(texts, list) else 1
         class DummyOutput:
-            input_ids = torch.tensor([[1, 2, 3]])
-            attention_mask = torch.tensor([[1, 1, 1]])
+            input_ids = torch.tensor([[1, 2, 3]]).repeat(batch_size, 1)
+            attention_mask = torch.tensor([[1, 1, 1]]).repeat(batch_size, 1)
         return DummyOutput()
 
     def encode(self, text):
@@ -24,7 +25,11 @@ class DummyTokenizer:
 def dummy_config():
     cfg = OmegaConf.create({
         "agent_proxy": {
+            "context_window_mode": "limited_multi_turn",
             "max_context_window": 2,
+            # This unit fixture predates exact rollout token traces and
+            # intentionally exercises the explicit legacy text path.
+            "allow_legacy_retokenization": True,
             "enable_think": False,
             "use_turn_scores": False,
             "action_sep": "|",
@@ -67,6 +72,7 @@ def test_context_window_truncation(dummy_config):
     env_outputs = [{
         "env_id": 0,
         "group_id": 0,
+        "tag": "sokoban",
         "history": [
             {"state": "S1", "llm_response": "R1", "reward": 0.1, "actions_left": 5},
             {"state": "S2", "llm_response": "R2", "reward": 0.2, "actions_left": 4},
@@ -76,7 +82,7 @@ def test_context_window_truncation(dummy_config):
     }]
 
     lm_inputs: DataProto = ctx.get_lm_inputs(env_outputs, prepare_for_update=True)
-    messages = lm_inputs.non_tensor_batch["messages_list"][0]
+    messages = lm_inputs.non_tensor_batch["messages_list"][-1]
 
     # Ensure only last 2 turns are present
     assert "S1" not in str(messages)

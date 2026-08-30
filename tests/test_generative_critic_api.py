@@ -8,6 +8,8 @@ which are the two failure modes that can silently corrupt an RL rollout.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -62,7 +64,7 @@ def test_score_prompt_contains_transition_and_machine_contract():
         turn_number=3,
         has_after_state=True,
         env_instruction="Solve the puzzle",
-        critic_instruction=None,
+        critic_instruction="Prefer legal moves. Output ###label: True or ###label: False.",
         response_format="score_only",
     )
     assert "before-state" in prompt
@@ -72,6 +74,13 @@ def test_score_prompt_contains_transition_and_machine_contract():
     assert "FINAL_SCORE: 1" in prompt
     assert "FINAL_SCORE: 0" in prompt
     assert "FINAL_SCORE: -1" in prompt
+    assert "Output exactly one line and nothing else" in prompt
+    assert "ignore any conflicting True/False output instruction" in prompt
+    assert "rationale" not in prompt.lower()
+
+    system_message = critic._build_deepseek_messages(prompt)[0]["content"]
+    assert "Return exactly one line" in system_message
+    assert "rationale" not in system_message.lower()
 
 
 def test_api_backend_forces_integer_protocol_when_base_config_is_legacy():
@@ -98,28 +107,39 @@ def test_environment_key_takes_precedence_over_config(monkeypatch):
 
 
 class _FakeCompletions:
-    def __init__(self, responder):
+    def __init__(self, responder, usage=None):
         self.responder = responder
+        self.usage = usage
         self.calls = []
+        self.event_loop_ids = []
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
+        self.event_loop_ids.append(id(asyncio.get_running_loop()))
         await asyncio.sleep(0)
         result = self.responder(kwargs)
+        if inspect.isawaitable(result):
+            result = await result
         if isinstance(result, BaseException):
             raise result
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=result))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=result))],
+            usage=self.usage,
         )
 
 
 class _FakeClient:
-    def __init__(self, responder):
-        self.chat = SimpleNamespace(completions=_FakeCompletions(responder))
+    def __init__(self, responder, usage=None):
+        self.chat = SimpleNamespace(completions=_FakeCompletions(responder, usage=usage))
+        self.close_calls = 0
+
+    async def close(self):
+        self.close_calls += 1
 
 
 def test_api_requests_are_parallel_deduplicated_and_cached():
-    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: 1")
+    usage = SimpleNamespace(prompt_tokens=11, completion_tokens=3)
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: 1", usage=usage)
     critic = FrozenGenerativeCritic(_config())
     critic._deepseek_client = fake
 
@@ -127,11 +147,124 @@ def test_api_requests_are_parallel_deduplicated_and_cached():
     assert first == ["FINAL_SCORE: 1"] * 3
     assert len(fake.chat.completions.calls) == 2
     assert critic._last_generation_metadata["gen_critic/api_deduplicated_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_deduplicated_rate"] == pytest.approx(1 / 3)
+    assert critic._last_generation_metadata["gen_critic/api_cache_hit_rate"] == 0.0
+    assert critic._last_generation_metadata["gen_critic/api_input_token_count"] == 22.0
+    assert critic._last_generation_metadata["gen_critic/api_output_token_count"] == 6.0
+    assert critic._last_generation_metadata["gen_critic/api_usage_reported_request_count"] == 2.0
+    assert critic._last_generation_metadata["gen_critic/api_wall_time_s"] > 0.0
+    assert critic._last_generation_metadata["gen_critic/api_labels_per_second"] > 0.0
 
     second = critic._generate_texts(["same", "new"])
     assert second == ["FINAL_SCORE: 1", "FINAL_SCORE: 1"]
     assert len(fake.chat.completions.calls) == 3
     assert critic._last_generation_metadata["gen_critic/api_cache_hit_count"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_cache_hit_rate"] == 0.5
+    assert critic._last_generation_metadata["gen_critic/api_request_avoidance_rate"] == 0.5
+
+
+def test_cache_and_dedupe_use_the_actual_truncated_prompt():
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: 0")
+    critic = FrozenGenerativeCritic(_config(deepseek_max_prompt_chars=40))
+    critic._deepseek_client = fake
+    prefix = "p" * 20
+    suffix = "s" * 20
+    first_prompt = prefix + ("a" * 100) + suffix
+    second_prompt = prefix + ("b" * 100) + suffix
+
+    assert critic._generate_texts([first_prompt, second_prompt]) == ["FINAL_SCORE: 0"] * 2
+    assert len(fake.chat.completions.calls) == 1
+    sent_prompt = fake.chat.completions.calls[0]["messages"][1]["content"]
+    assert sent_prompt == critic._truncate_deepseek_prompt(first_prompt)
+    assert critic._last_generation_metadata["gen_critic/api_deduplicated_count"] == 1.0
+
+    assert critic._generate_texts([second_prompt]) == ["FINAL_SCORE: 0"]
+    assert len(fake.chat.completions.calls) == 1
+    assert critic._last_generation_metadata["gen_critic/api_cache_hit_rate"] == 1.0
+
+
+def test_persistent_loop_and_owned_client_are_reused_and_closed(monkeypatch):
+    import openai
+
+    created_clients = []
+
+    def make_client(**kwargs):
+        client = _FakeClient(lambda request: "FINAL_SCORE: 1")
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", make_client)
+    critic = FrozenGenerativeCritic(_config(deepseek_cache_enable=False))
+
+    assert critic._generate_texts(["first"]) == ["FINAL_SCORE: 1"]
+    assert critic._generate_texts(["second"]) == ["FINAL_SCORE: 1"]
+    assert len(created_clients) == 1
+    loop_ids = created_clients[0].chat.completions.event_loop_ids
+    assert len(loop_ids) == 2
+    assert len(set(loop_ids)) == 1
+
+    critic.close()
+    assert created_clients[0].close_calls == 1
+    assert critic._deepseek_event_loop is None
+
+
+def test_sync_api_call_is_safe_inside_an_active_event_loop():
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: -1")
+    critic = FrozenGenerativeCritic(_config())
+    critic._deepseek_client = fake
+
+    async def invoke_sync_api():
+        return critic._generate_texts(["inside-running-loop"])
+
+    assert asyncio.run(invoke_sync_api()) == ["FINAL_SCORE: -1"]
+
+
+def test_retry_delay_includes_small_bounded_jitter(monkeypatch):
+    monkeypatch.setattr("ragen.trainer.generative_critic.random.uniform", lambda low, high: high)
+    assert FrozenGenerativeCritic._retry_delay(0) == pytest.approx(1.1)
+    assert FrozenGenerativeCritic._retry_delay(3) == pytest.approx(8.25)
+
+
+def test_batch_deadline_keeps_completed_results_and_times_out_pending_requests():
+    async def responder(kwargs):
+        prompt = kwargs["messages"][1]["content"]
+        if prompt == "slow":
+            await asyncio.sleep(1.0)
+            return "FINAL_SCORE: -1"
+        return "FINAL_SCORE: 1"
+
+    fake = _FakeClient(responder)
+    critic = FrozenGenerativeCritic(
+        _config(deepseek_batch_timeout=0.02, deepseek_max_retries=0, deepseek_cache_enable=False)
+    )
+    critic._deepseek_client = fake
+
+    started_at = time.perf_counter()
+    outputs = critic._generate_texts(["fast", "slow", "slow"])
+    wall_time = time.perf_counter() - started_at
+
+    assert outputs == ["FINAL_SCORE: 1", "", ""]
+    assert wall_time < 0.5
+    assert critic._last_generation_metadata["gen_critic/api_batch_timeout_count"] == 2.0
+    assert critic._last_generation_metadata["gen_critic/api_batch_timeout"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_timeout_count"] == 2.0
+    assert critic._last_generation_metadata["gen_critic/api_failure_count"] == 2.0
+    assert critic._last_generation_metadata["gen_critic/api_batch_failed"] == 0.0
+
+
+def test_nonpositive_batch_deadline_is_disabled():
+    async def responder(kwargs):
+        await asyncio.sleep(0.01)
+        return "FINAL_SCORE: 0"
+
+    fake = _FakeClient(responder)
+    critic = FrozenGenerativeCritic(
+        _config(deepseek_batch_timeout=0, deepseek_max_retries=0, deepseek_cache_enable=False)
+    )
+    critic._deepseek_client = fake
+
+    assert critic._generate_texts(["wait-for-result"]) == ["FINAL_SCORE: 0"]
+    assert critic._last_generation_metadata["gen_critic/api_batch_timeout"] == 0.0
 
 
 def test_malformed_api_output_is_not_cached():
@@ -207,3 +340,4 @@ def test_missing_api_key_preserves_batch_shape_and_reports_failure(monkeypatch):
     outputs = critic._generate_texts(["a", "b"])
     assert outputs == ["", ""]
     assert critic._last_generation_metadata["gen_critic/api_batch_failed"] == 1.0
+    assert critic._last_generation_metadata["gen_critic/api_request_count"] == 0.0
