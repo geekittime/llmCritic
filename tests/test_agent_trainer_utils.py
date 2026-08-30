@@ -22,7 +22,7 @@ def test_adjust_batch_copy_preserves_each_source_rows_total_weight():
     adjusted = adjust_batch(_batch(3), size_divisor=8, mode="copy")
 
     assert adjusted.batch.batch_size[0] == 8
-    assert adjusted.batch["sample_weights"].sum().item() == 3.0
+    assert torch.allclose(adjusted.batch["sample_weights"].sum(), torch.tensor(3.0))
     for row_id in range(3):
         mask = adjusted.batch["row_id"] == row_id
         assert torch.allclose(adjusted.batch["sample_weights"][mask].sum(), torch.tensor(1.0))
