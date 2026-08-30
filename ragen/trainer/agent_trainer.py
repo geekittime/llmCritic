@@ -113,6 +113,32 @@ def compose_turn_advantages(
     )
 
 
+def validate_deepseek_batch_health(
+    metrics: dict[str, float],
+    *,
+    abort_on_auth_failure: bool = True,
+    max_failure_rate: float = 0.25,
+    max_parse_fail_rate: float = 0.25,
+) -> None:
+    """Stop before PPO update when judge failures are clearly systemic."""
+    auth_failures = float(metrics.get("gen_critic/api_auth_failure_count", 0.0))
+    missing_key = float(metrics.get("gen_critic/api_missing_key", 0.0))
+    failure_rate = float(metrics.get("gen_critic/api_failure_rate", 0.0))
+    parse_fail_rate = float(metrics.get("gen_critic/parse_fail_rate", 0.0))
+
+    reasons: list[str] = []
+    if abort_on_auth_failure and (auth_failures > 0.0 or missing_key > 0.0):
+        reasons.append("authentication or credential failure")
+    if max_failure_rate >= 0.0 and failure_rate > max_failure_rate:
+        reasons.append(f"API failure rate {failure_rate:.3f} > {max_failure_rate:.3f}")
+    if max_parse_fail_rate >= 0.0 and parse_fail_rate > max_parse_fail_rate:
+        reasons.append(f"parse failure rate {parse_fail_rate:.3f} > {max_parse_fail_rate:.3f}")
+    if reasons:
+        raise RuntimeError(
+            "DeepSeek judge batch rejected before actor update: " + "; ".join(reasons)
+        )
+
+
 def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> DataProto:
     """
     Adjust batch size to be divisible by size_divisor.
@@ -1806,6 +1832,31 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                             turn_ids=turn_ids,
                                         )
                             label_tensor = label_tensor.to(response_mask.device, dtype=torch.float32)
+                            if self.generative_critic.backend in {"deepseek_api", "deepseek"}:
+                                validate_deepseek_batch_health(
+                                    label_metrics,
+                                    abort_on_auth_failure=bool(
+                                        OmegaConf.select(
+                                            self.config,
+                                            "generative_critic.deepseek_abort_on_auth_failure",
+                                            default=True,
+                                        )
+                                    ),
+                                    max_failure_rate=float(
+                                        OmegaConf.select(
+                                            self.config,
+                                            "generative_critic.deepseek_max_failure_rate",
+                                            default=0.25,
+                                        )
+                                    ),
+                                    max_parse_fail_rate=float(
+                                        OmegaConf.select(
+                                            self.config,
+                                            "generative_critic.deepseek_max_parse_fail_rate",
+                                            default=0.25,
+                                        )
+                                    ),
+                                )
 
                         label_turn = collapse_turn_scores(
                             label_tensor,

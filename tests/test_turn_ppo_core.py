@@ -2,6 +2,7 @@ import inspect
 from types import MethodType, SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from tensordict import TensorDict
 from verl import DataProto
@@ -15,6 +16,7 @@ from ragen.trainer.agent_trainer import (
     normalize_turn_scores,
     place_turn_endpoint_rewards,
     trajectory_outcomes,
+    validate_deepseek_batch_health,
 )
 from ragen.trainer.core_algos import compute_turn_gae_advantage_return
 from ragen.workers.actor.dp_actor import (
@@ -514,6 +516,30 @@ def test_weighted_turn_advantage_keeps_existing_behavior():
     )
 
     assert torch.allclose(advantages, torch.tensor([[1.5, -0.5, -2.5]]))
+
+
+def test_deepseek_batch_health_allows_isolated_negative_fallbacks():
+    validate_deepseek_batch_health(
+        {
+            "gen_critic/api_failure_rate": 0.01,
+            "gen_critic/parse_fail_rate": 0.02,
+            "gen_critic/api_auth_failure_count": 0.0,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        {"gen_critic/api_auth_failure_count": 1.0},
+        {"gen_critic/api_missing_key": 1.0},
+        {"gen_critic/api_failure_rate": 0.251},
+        {"gen_critic/parse_fail_rate": 0.251},
+    ],
+)
+def test_deepseek_batch_health_stops_systemic_failures(metrics):
+    with pytest.raises(RuntimeError, match="rejected before actor update"):
+        validate_deepseek_batch_health(metrics)
 
 
 def test_last_turn_outcome_uses_episode_metadata_for_expanded_rows():

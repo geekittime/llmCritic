@@ -44,6 +44,8 @@ def _config(**critic_overrides):
         ("No progress.\nFINAL_SCORE: 0", 0),
         ("Deadlock.\nFINAL_SCORE: -1", -1),
         ("1", 1),
+        ("```\nFINAL_SCORE: 1\n```", 1),
+        ("```text\nFINAL_SCORE: 0\n```", 0),
         ("```\nFINAL_SCORE: -1\n```", -1),
         ("<answer>0</answer>", 0),
         ("The coordinates include 1 and 0.\nNo final score.", -1),
@@ -83,6 +85,33 @@ def test_score_prompt_contains_transition_and_machine_contract():
     system_message = critic._build_deepseek_messages(prompt)[0]["content"]
     assert "Return exactly one line" in system_message
     assert "rationale" not in system_message.lower()
+
+
+def test_score_protocol_prefers_task_specific_integer_rubric():
+    config = _config()
+    config.custom_envs = {
+        "Puzzle": {
+            "env_instruction": "Solve this puzzle.",
+            "critic_instruction": "Legacy neutral actions are False.",
+            "score_critic_instruction": "Neutral actions receive integer score 0.",
+        }
+    }
+    critic = FrozenGenerativeCritic(config)
+    instruction = critic._get_task_specific_critic_instruction("Solve this puzzle. Carefully.")
+    assert instruction == "Neutral actions receive integer score 0."
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "prefix\n```\nFINAL_SCORE: 1\n```",
+        "```\nFINAL_SCORE: 1\n```\nsuffix",
+        "```\n```\nFINAL_SCORE: 1\n```",
+        "```\nFINAL_SCORE: 1",
+    ],
+)
+def test_score_parser_rejects_non_outer_or_malformed_fences(text):
+    assert FrozenGenerativeCritic._parse_score_optional(text) is None
 
 
 def test_api_backend_forces_integer_protocol_when_base_config_is_legacy():

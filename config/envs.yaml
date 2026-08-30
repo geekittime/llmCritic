@@ -71,6 +71,12 @@ custom_envs:
       Output format (two lines):
       1) First, give a detailed rationale grounded in the transition above. You should check the coordinates before and after the action, check whether the action is helpful to push the box towards the target. Note that the player should push the box to the target, only move towards the target is not helpful.
       2) A label based on the rationale above: '###label: True' or '###label: False'. Note that if the actions are neither helpful nor harmful, output '###label: False'.
+    score_critic_instruction: |
+      Evaluate progress in Sokoban by future solvability, not merely by Manhattan distance or by whether the player moved.
+      Score +1 when the action makes a correct push, safely reduces the remaining solution effort, or performs a necessary player reposition that measurably improves access to a beneficial push without an offsetting regression.
+      Score -1 for an invalid action, an avoidable no-op, a harmful push, a deadlock, loss of access to the box, or any transition that makes the puzzle less solvable. A push geometrically nearer to the target is still -1 if it creates a deadlock.
+      Score 0 when the meaningful puzzle state and available push plan are unchanged, including reversible player movement that does not improve access, or when gains and regressions genuinely balance.
+      Do not call movement toward a box or target positive unless the resulting state makes a useful future push more achievable.
     max_tokens: 120
     parallel_friendly: false
     max_workers: 32

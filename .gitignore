@@ -117,3 +117,9 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 
 
 log/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+secrets.env

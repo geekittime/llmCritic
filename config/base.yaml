@@ -130,6 +130,11 @@ generative_critic:
   deepseek_max_concurrency: 16
   deepseek_max_tokens: 32
   deepseek_raise_on_error: False
+  # Individual failures remain -1. Abort only when a whole judge batch is
+  # unhealthy, before those fallback labels can update the actor.
+  deepseek_abort_on_auth_failure: True
+  deepseek_max_failure_rate: 0.25
+  deepseek_max_parse_fail_rate: 0.25
   deepseek_cache_enable: True
   deepseek_cache_size: 4096
   deepseek_max_prompt_chars: 12000

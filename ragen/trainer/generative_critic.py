@@ -50,6 +50,7 @@ _PLAIN_SCORE_PATTERN = re.compile(
     r"^[\s`*_#]*(?P<value>[+-]?[01])[\s`*_#.,;:!?]*$",
     re.IGNORECASE,
 )
+_CODE_FENCE_OPEN_PATTERN = re.compile(r"^(?P<fence>`{3,})(?:[A-Za-z0-9_.+-]+)?\s*$")
 _LABEL_PATTERN = re.compile(r"###\s*label\s*:\s*(true|false)", re.IGNORECASE)
 _FALLBACK_BOOL_PATTERN = re.compile(r"\b(true|false)\b", re.IGNORECASE)
 _CACHE_PROTOCOL_VERSION = "turn-progress-score-v2"
@@ -384,16 +385,28 @@ class FrozenGenerativeCritic:
         """Fetch task-specific critic instruction from config/custom_envs.
 
         Matching strategy: if a custom env's env_instruction appears in the
-        system instruction text, use that env's critic_instruction when present.
+        system instruction text, prefer its integer-score rubric for the API
+        protocol and otherwise retain the legacy critic instruction.
         """
         custom_envs = OmegaConf.select(self.config, "custom_envs", default=None)
         if custom_envs is None:
             return None
 
         env_instruction_lower = env_instruction.lower()
+        is_score_protocol = self.response_format in {
+            "score",
+            "score_only",
+            "integer",
+            "integer_score",
+            "deepseek",
+        }
         for _, env_cfg in custom_envs.items():
             base_instruction = str(env_cfg.get("env_instruction", "")).strip()
-            critic_instruction = env_cfg.get("critic_instruction", None)
+            critic_instruction = None
+            if is_score_protocol:
+                critic_instruction = env_cfg.get("score_critic_instruction", None)
+            if critic_instruction is None:
+                critic_instruction = env_cfg.get("critic_instruction", None)
             if not base_instruction or critic_instruction is None:
                 continue
             if base_instruction.lower() in env_instruction_lower:
@@ -539,6 +552,31 @@ class FrozenGenerativeCritic:
                 return line.strip()
         return ""
 
+    @staticmethod
+    def _unwrap_single_outer_code_fence(text: str) -> str:
+        """Remove one complete outer Markdown fence without relaxing parsing.
+
+        Chat models occasionally wrap an otherwise valid one-line answer in a
+        code block. Only a fence spanning the entire response is accepted;
+        nested fences or any text outside it remain malformed.
+        """
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        nonempty_indexes = [index for index, line in enumerate(lines) if line.strip()]
+        if len(nonempty_indexes) < 3:
+            return normalized
+
+        first_index = nonempty_indexes[0]
+        last_index = nonempty_indexes[-1]
+        opening = _CODE_FENCE_OPEN_PATTERN.fullmatch(lines[first_index].strip())
+        if opening is None or lines[last_index].strip() != opening.group("fence"):
+            return normalized
+
+        inner_lines = lines[first_index + 1 : last_index]
+        if any(line.strip().startswith("```") for line in inner_lines):
+            return normalized
+        return "\n".join(inner_lines)
+
     @classmethod
     def _parse_score_optional(cls, text: str) -> Optional[int]:
         """Parse only an explicit score on the final non-empty output line.
@@ -548,7 +586,13 @@ class FrozenGenerativeCritic:
         last integer would silently convert those numbers into supervision.
         ``None`` means the model did not follow the score protocol.
         """
-        last_line = cls._last_nonempty_line(text)
+        normalized_text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        unwrapped_text = cls._unwrap_single_outer_code_fence(normalized_text)
+        if unwrapped_text == normalized_text and any(
+            line.strip().startswith("```") for line in normalized_text.split("\n")
+        ):
+            return None
+        last_line = cls._last_nonempty_line(unwrapped_text)
         if not last_line:
             return None
 

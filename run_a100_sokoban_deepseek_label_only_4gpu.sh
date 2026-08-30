@@ -87,6 +87,13 @@ export ENTROPY_COEFF=0.0
 export PPO_EPOCHS=1
 
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.50}"
+# The run emits exactly 32 rollouts per train/validation batch. Avoid vLLM's
+# default 1024-sequence scheduler allocation; shared hosts may additionally set
+# VLLM_ENFORCE_EAGER=True to skip CUDA-graph compilation and capture.
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-32}"
+export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-False}"
+export ACTOR_USE_TORCH_COMPILE="${ACTOR_USE_TORCH_COMPILE:-True}"
+export ACTOR_FSDP_USE_TORCH_COMPILE="${ACTOR_FSDP_USE_TORCH_COMPILE:-True}"
 export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-12288}"
 export USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 export USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
