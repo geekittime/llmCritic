@@ -412,6 +412,11 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
+            # Ray dispatch keeps the DataProto payload on CPU. FSDP moves
+            # forward inputs internally, but labels and unpadding indices do
+            # not pass through that hook. Move the complete micro-batch here
+            # so FlashAttention/Triton never receives CPU pointer arguments.
+            micro_batch = micro_batch.to(get_device_id())
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():

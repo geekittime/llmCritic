@@ -3,6 +3,7 @@ from types import MethodType, SimpleNamespace
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 from verl import DataProto
 from verl.trainer.ppo.core_algos import compute_policy_loss
 
@@ -406,7 +407,7 @@ def test_inverse_multiplicity_weights_survive_multiple_optimizer_steps():
     assert torch.allclose(accumulated_loss, 2.0 * full_loss)
 
 
-def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction():
+def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction(monkeypatch):
     actor = object.__new__(DataParallelPPOActor)
     actor.config = SimpleNamespace(entropy_coeff=0.0)
     actor.ulysses_sequence_parallel_size = 1
@@ -415,6 +416,16 @@ def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction():
         eval=lambda: None,
     )
     entropy_requests = []
+    moved_micro_batches = []
+
+    original_to = TensorDict.to
+
+    def tracking_to(self, *args, **kwargs):
+        moved_micro_batches.append((args, kwargs))
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(TensorDict, "to", tracking_to)
+    monkeypatch.setattr("ragen.workers.actor.dp_actor.get_device_id", lambda: torch.device("cpu"))
 
     def fake_forward(self, micro_batch, temperature, calculate_entropy=False):
         entropy_requests.append(calculate_entropy)
@@ -440,6 +451,7 @@ def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction():
     log_probs, entropys = actor.compute_log_prob(data, calculate_entropy=True)
 
     assert entropy_requests == [False, False]
+    assert len(moved_micro_batches) == 2
     assert torch.equal(log_probs, responses.float() / 2.0)
     assert torch.equal(entropys, torch.zeros_like(log_probs))
 
