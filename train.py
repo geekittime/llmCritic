@@ -317,11 +317,17 @@ def run_ppo(config) -> None:
             'VLLM_LOGGING_LEVEL': 'WARN',
             "RAY_DEBUG": "legacy",  # used here for simpler breakpoint()
         }
-        ray.init(
-            address="local",
-            include_dashboard=False,
-            runtime_env={'env_vars': ray_env_vars},
-        )
+        ray_init_config = config.get("ray_kwargs", {}).get("ray_init", {})
+        configured_num_cpus = ray_init_config.get("num_cpus", None)
+        ray_init_kwargs = {
+            "address": "local",
+            "include_dashboard": False,
+            "runtime_env": {"env_vars": ray_env_vars},
+        }
+        if configured_num_cpus is not None:
+            ray_init_kwargs["num_cpus"] = int(configured_num_cpus)
+        print(f"ray init kwargs: {ray_init_kwargs}")
+        ray.init(**ray_init_kwargs)
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))

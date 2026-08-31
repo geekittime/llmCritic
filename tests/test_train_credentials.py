@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
@@ -7,6 +8,7 @@ from train import (
     _load_task_credentials,
     _validate_credential_file,
     add_dependency_and_validate_config,
+    run_ppo,
 )
 
 
@@ -123,3 +125,31 @@ def test_label_only_config_rejects_advantage_rewrites(updates, message):
 
     with pytest.raises(ValueError, match=message):
         add_dependency_and_validate_config(config)
+
+
+def test_run_ppo_forwards_configured_ray_cpu_limit(monkeypatch):
+    config = OmegaConf.create(
+        {
+            "system": {"CUDA_VISIBLE_DEVICES": "6,7"},
+            "ray_kwargs": {"ray_init": {"num_cpus": 16}},
+        }
+    )
+    init_kwargs = {}
+
+    monkeypatch.setattr("train.ray.is_initialized", lambda: False)
+
+    def fake_init(**kwargs):
+        init_kwargs.update(kwargs)
+
+    monkeypatch.setattr("train.ray.init", fake_init)
+    fake_runner = SimpleNamespace(run=SimpleNamespace(remote=lambda _: None))
+    monkeypatch.setattr("train.TaskRunner.remote", lambda: fake_runner)
+    monkeypatch.setattr("train.ray.get", lambda _: None)
+
+    run_ppo(config)
+
+    assert init_kwargs["address"] == "local"
+    assert init_kwargs["include_dashboard"] is False
+    assert init_kwargs["num_cpus"] == 16
+    assert "DEEPSEEK_API_KEY" not in init_kwargs["runtime_env"]["env_vars"]
+    assert "WANDB_API_KEY" not in init_kwargs["runtime_env"]["env_vars"]
