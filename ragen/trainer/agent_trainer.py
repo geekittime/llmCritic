@@ -1779,10 +1779,36 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             f.write(str(self.global_steps))
 
     def fit(self):
+        self._tracking_logger = None
         try:
-            return self._fit_impl()
-        finally:
+            result = self._fit_impl()
+        except BaseException:
+            try:
+                self._shutdown_frozen_critic()
+            except Exception as exc:
+                print(f"Warning: resource shutdown also failed: {exc}")
+            self._finish_tracking(exit_code=1)
+            raise
+
+        try:
             self._shutdown_frozen_critic()
+        except BaseException:
+            self._finish_tracking(exit_code=1)
+            raise
+        self._finish_tracking(exit_code=0)
+        return result
+
+    def _finish_tracking(self, exit_code: int) -> None:
+        logger = self._tracking_logger
+        try:
+            if logger is not None:
+                logger.finish(exit_code=exit_code)
+        except Exception as exc:
+            print(f"Warning: failed to finalize experiment tracking: {exc}")
+        finally:
+            # Dropping the final reference gives a failed explicit finish one
+            # best-effort destructor retry without delaying interpreter exit.
+            self._tracking_logger = None
 
     def _fit_impl(self):
         """
@@ -1794,7 +1820,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
         from omegaconf import OmegaConf
 
-        from verl.utils.tracking import Tracking
+        from ragen.tracking import Tracking
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -1804,6 +1830,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             # an ad-hoc Hydra override instead of the recommended env var.
             config=redact_config(OmegaConf.to_container(self.config, resolve=True)),
         )
+        self._tracking_logger = logger
 
         self.global_steps = 0
 
@@ -1817,7 +1844,6 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
-                self._shutdown_frozen_critic()
                 return
 
         # add tqdm
@@ -2451,7 +2477,6 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             if is_last_step:
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
-                self._shutdown_frozen_critic()
                 return
 
             progress_bar.update(1)
