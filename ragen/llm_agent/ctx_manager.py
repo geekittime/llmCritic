@@ -279,9 +279,18 @@ class ContextManager:
                     f"In each assistant turn, output at most {turn_action_limit} action(s), separated by \" "
                     f"{self.action_sep} \"; do not add extra actions.\n"
                 )
+                if turn_action_limit == 1:
+                    action_lookup_str += (
+                        "Even if an earlier example shows an action sequence, this turn must contain "
+                        "exactly one valid action inside the answer tags.\n"
+                    )
                 env_instruction += action_lookup_str
             prefixes[env_tag] = env_instruction
-            env_config_lookup[env_tag] = {'max_tokens': env_config.get("max_tokens", self.config.actor_rollout_ref.rollout.response_length)}
+            rollout_response_length = int(self.config.actor_rollout_ref.rollout.response_length)
+            configured_max_tokens = int(env_config.get("max_tokens", rollout_response_length))
+            env_config_lookup[env_tag] = {
+                'max_tokens': min(configured_max_tokens, rollout_response_length)
+            }
 
         tags = self.es_cfg.env_configs.tags
         n_groups = self.es_cfg.env_configs.n_groups
@@ -300,9 +309,19 @@ class ContextManager:
         self.prefix_lookup = prefix_lookup
         self.env_config_lookup = env_config_lookup
 
-    def _parse_response(self, response: str) -> List:
+    def _parse_response(self, response: str) -> Tuple[str, List[str], Dict[str, Any]]:
+        """Parse one sampled turn and retain any protocol violation metadata."""
         pattern = r'<think>(.*?)</think>\s*<answer>(.*?)</answer>' if self.config.agent_proxy.enable_think else r'<answer>(.*?)</answer>'
-        match = re.search(pattern, response, re.DOTALL)
+        # Every sampled token belongs to this macro action's probability. Do
+        # not silently ignore leading/trailing text or a second answer block,
+        # since those unexecuted tokens would otherwise inherit its advantage.
+        match = re.fullmatch(pattern, response.strip(), re.DOTALL)
+        parse_metadata: Dict[str, Any] = {
+            "response_format_valid": bool(match),
+            "action_format_valid": bool(match),
+            "action_count_exceeded": False,
+            "raw_action_count": 0,
+        }
         if not match:
             # think_content, action_content, actions = "", "", [] # do not remove this kind of invalid string
             llm_response, actions = response, []
@@ -312,20 +331,30 @@ class ContextManager:
             else:
                 think_content, action_content = "", match.group(1)
 
-                
+            raw_action_segments = action_content.split(self.action_sep)
+            contains_nested_special_token = any(
+                special_token in action_content for special_token in self.special_token_list
+            )
+            has_empty_action_segment = any(not segment.strip() for segment in raw_action_segments)
+            parse_metadata["action_format_valid"] = not (
+                contains_nested_special_token or has_empty_action_segment
+            )
+
             for special_token in self.special_token_list:
                 action_content = action_content.replace(special_token, "").strip()
                 think_content = think_content.replace(special_token, "").strip()
             
             actions = [action.strip() for action in action_content.split(self.action_sep) if action.strip()]
-            max_actions = self.config.agent_proxy.max_actions_per_turn
+            parse_metadata["raw_action_count"] = len(actions)
+            max_actions = int(self.config.agent_proxy.max_actions_per_turn)
 
             if len(actions) > max_actions:
+                parse_metadata["action_count_exceeded"] = True
                 actions = actions[:max_actions] #Only the first MAX_ACTIONS actions are kept in the rollout.
                 action_content = (" " + self.action_sep + " ").join(actions)
 
             llm_response = f"<think>{think_content}</think><answer>{action_content}</answer>" if self.config.agent_proxy.enable_think else f"<answer>{action_content}</answer>"
-        return llm_response, actions
+        return llm_response, actions, parse_metadata
         
     def _normalize_score_tensor(self, score_tensor: torch.Tensor, env_outputs: List[Dict]) -> torch.Tensor:
         """
@@ -1173,7 +1202,26 @@ class ContextManager:
                     {"role": "user", "content": before_content},
                     {
                         "role": "assistant",
-                        "content": turn.get("llm_raw_response", turn["llm_response"]),
+                        # The transition is defined by what the environment
+                        # actually executed. Keep the sampled text separately
+                        # for diagnostics and deterministic invalid-turn rules.
+                        "content": (
+                            (" " + self.action_sep + " ").join(
+                                str(action) for action in turn.get("executed_action_texts", [])
+                            )
+                            or "<no action executed>"
+                        ),
+                        "raw_content": turn.get("llm_raw_response", turn["llm_response"]),
+                        "canonical_content": turn.get("llm_response", ""),
+                        "response_format_valid": bool(turn.get("response_format_valid", True)),
+                        "action_format_valid": bool(turn.get("action_format_valid", True)),
+                        "action_count_exceeded": bool(turn.get("action_count_exceeded", False)),
+                        "manager_invalid_action": bool(turn.get("manager_invalid_action", False)),
+                        "trajectory_action_truncated": bool(
+                            turn.get("trajectory_action_truncated", False)
+                        ),
+                        "judge_force_negative": bool(turn.get("judge_force_negative", False)),
+                        "judge_force_reason": str(turn.get("judge_force_reason", "")),
                     },
                 ]
                 after_content = f"Reward:\n{turn.get('reward', 0.0)}\n"
@@ -1603,12 +1651,13 @@ class ContextManager:
         env_ids = lm_outputs.non_tensor_batch['env_ids']
         env_inputs = []
         for output_index, (env_id, response) in enumerate(zip(env_ids, responses)):
-            llm_response, actions = self._parse_response(response)
+            llm_response, actions, parse_metadata = self._parse_response(response)
             env_input = {
                 "env_id": env_id,
                 "llm_raw_response": response,
                 "llm_response": llm_response,
                 "actions": actions,
+                **parse_metadata,
             }
             if prompt_token_ids is not None and response_token_ids is not None:
                 env_input["prompt_token_ids"] = prompt_token_ids[output_index]

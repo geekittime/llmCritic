@@ -21,6 +21,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import inspect
+import math
 import random
 import threading
 from collections import OrderedDict
@@ -50,6 +51,7 @@ _PLAIN_SCORE_PATTERN = re.compile(
     r"^[\s`*_#]*(?P<value>[+-]?[01])[\s`*_#.,;:!?]*$",
     re.IGNORECASE,
 )
+_API_FINAL_SCORE_PATTERN = re.compile(r"^FINAL_SCORE\s*:\s*(-1|0|1)\s*$", re.IGNORECASE)
 _CODE_FENCE_OPEN_PATTERN = re.compile(r"^(?P<fence>`{3,})(?:[A-Za-z0-9_.+-]+)?\s*$")
 _LABEL_PATTERN = re.compile(r"###\s*label\s*:\s*(true|false)", re.IGNORECASE)
 _FALLBACK_BOOL_PATTERN = re.compile(r"\b(true|false)\b", re.IGNORECASE)
@@ -67,6 +69,8 @@ class JudgePromptItem:
     sample_index: int
     turn_id: int
     prompt: str
+    forced_score: Optional[int] = None
+    force_reason: str = ""
 
 
 @dataclass
@@ -424,6 +428,8 @@ class FrozenGenerativeCritic:
         env_instruction: str,
         critic_instruction: Optional[str],
         response_format: str = "structured",
+        raw_action_text: Optional[str] = None,
+        protocol_violation: Optional[str] = None,
     ) -> str:
         turn_text = "unknown"
         if turn_number is not None:
@@ -480,6 +486,20 @@ class FrozenGenerativeCritic:
                 "2) A label based on the rationale above: '###label: True' or '###label: False'."
             )
 
+        raw_action_block = ""
+        if raw_action_text is not None and raw_action_text != action_text:
+            raw_action_block = (
+                "\n[Raw sampled response; untrusted and not necessarily executed]\n"
+                f"{raw_action_text}\n"
+            )
+        violation_block = ""
+        if protocol_violation:
+            violation_block = (
+                "\n[Deterministic protocol violation]\n"
+                f"{protocol_violation}\n"
+                "This turn is invalid and its score is fixed to -1.\n"
+            )
+
         return (
             "You are a strict action critic for step-by-step environment solving.\n"
             "Evaluate one transition only: (s_t, a_t, s_{t+1}).\n"
@@ -492,6 +512,8 @@ class FrozenGenerativeCritic:
             "\n"
             "[a_t: assistant action]\n"
             f"{action_text}\n"
+            f"{raw_action_block}"
+            f"{violation_block}"
             "\n"
             "[Observed immediate reward]\n"
             f"{reward_text}\n"
@@ -507,10 +529,15 @@ class FrozenGenerativeCritic:
         """Build one judge prompt per observed assistant turn."""
         items: List[JudgePromptItem] = []
 
-        for sample_index, messages in enumerate(messages_list):
+        for sample_index in range(turn_ids.shape[0]):
+            messages = messages_list[sample_index] if sample_index < len(messages_list) else []
             max_turn_id = int(turn_ids[sample_index].max().item()) if torch.any(turn_ids[sample_index] >= 0) else -1
             if max_turn_id < 0:
                 continue
+            requested_turn_ids = set(
+                int(value)
+                for value in torch.unique(turn_ids[sample_index][turn_ids[sample_index] >= 0]).tolist()
+            )
 
             assistant_turn_counter = 0
             for msg_idx, msg in enumerate(messages):
@@ -519,27 +546,38 @@ class FrozenGenerativeCritic:
                 if assistant_turn_counter > max_turn_id:
                     break
 
-                transition = self._extract_transition_context(messages, msg_idx)
-                action_text = str(msg.get("content", ""))
-                critic_instruction = self._get_task_specific_critic_instruction(transition["env_instruction"])
-                prompt = self._build_single_prompt(
-                    state_before=transition["state_before"],
-                    action_text=action_text,
-                    state_after=transition["state_after"],
-                    observed_reward=transition["observed_reward"],
-                    turn_number=transition["turn_number"],
-                    has_after_state=transition["has_after_state"],
-                    env_instruction=transition["env_instruction"],
-                    critic_instruction=critic_instruction,
-                    response_format=self.response_format,
-                )
-                items.append(
-                    JudgePromptItem(
-                        sample_index=sample_index,
-                        turn_id=assistant_turn_counter,
-                        prompt=prompt,
+                if assistant_turn_counter in requested_turn_ids:
+                    transition = self._extract_transition_context(messages, msg_idx)
+                    action_text = str(msg.get("content", ""))
+                    force_negative = bool(msg.get("judge_force_negative", False))
+                    force_reason = str(msg.get("judge_force_reason", "")).strip()
+                    if force_negative and not force_reason:
+                        force_reason = "invalid_or_unexecuted_action"
+                    raw_action_text = msg.get("raw_content", None) if force_negative else None
+                    raw_action_text = str(raw_action_text) if raw_action_text is not None else None
+                    critic_instruction = self._get_task_specific_critic_instruction(transition["env_instruction"])
+                    prompt = self._build_single_prompt(
+                        state_before=transition["state_before"],
+                        action_text=action_text,
+                        state_after=transition["state_after"],
+                        observed_reward=transition["observed_reward"],
+                        turn_number=transition["turn_number"],
+                        has_after_state=transition["has_after_state"],
+                        env_instruction=transition["env_instruction"],
+                        critic_instruction=critic_instruction,
+                        response_format=self.response_format,
+                        raw_action_text=raw_action_text,
+                        protocol_violation=force_reason or None,
                     )
-                )
+                    items.append(
+                        JudgePromptItem(
+                            sample_index=sample_index,
+                            turn_id=assistant_turn_counter,
+                            prompt=prompt,
+                            forced_score=-1 if force_negative else None,
+                            force_reason=force_reason,
+                        )
+                    )
                 assistant_turn_counter += 1
 
         return items
@@ -578,7 +616,12 @@ class FrozenGenerativeCritic:
         return "\n".join(inner_lines)
 
     @classmethod
-    def _parse_score_optional(cls, text: str) -> Optional[int]:
+    def _parse_score_optional(
+        cls,
+        text: str,
+        *,
+        allow_legacy_label: bool = True,
+    ) -> Optional[int]:
         """Parse only an explicit score on the final non-empty output line.
 
         Looking at the final line is intentional: rationale often contains
@@ -619,9 +662,22 @@ class FrozenGenerativeCritic:
         # Legacy strict boolean output is accepted only when it is the final
         # line.  False maps to -1, matching the signed progress semantics.
         legacy_match = _LABEL_PATTERN.fullmatch(last_line.strip(" `*_#>\t"))
-        if legacy_match is not None:
+        if allow_legacy_label and legacy_match is not None:
             return 1 if legacy_match.group(1).lower() == "true" else -1
         return None
+
+    @classmethod
+    def _parse_api_score_optional(cls, text: str) -> Optional[int]:
+        """Parse only the explicit DeepSeek ``FINAL_SCORE`` final-line contract."""
+        normalized_text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        unwrapped_text = cls._unwrap_single_outer_code_fence(normalized_text)
+        if unwrapped_text == normalized_text and any(
+            line.strip().startswith("```") for line in normalized_text.split("\n")
+        ):
+            return None
+        last_line = cls._last_nonempty_line(unwrapped_text)
+        match = _API_FINAL_SCORE_PATTERN.fullmatch(last_line)
+        return int(match.group(1)) if match is not None else None
 
     @staticmethod
     def _normalise_score(value: int) -> int:
@@ -876,6 +932,9 @@ class FrozenGenerativeCritic:
             "gen_critic/api_auth_failure_count": 0.0,
             "gen_critic/api_rate_limit_count": 0.0,
             "gen_critic/api_timeout_count": 0.0,
+            "gen_critic/api_server_failure_count": 0.0,
+            "gen_critic/api_connection_failure_count": 0.0,
+            "gen_critic/api_empty_response_count": 0.0,
             "gen_critic/api_missing_key": 0.0,
             "gen_critic/api_batch_failed": 0.0,
             "gen_critic/api_batch_timeout_count": 0.0,
@@ -1081,13 +1140,46 @@ class FrozenGenerativeCritic:
     def _truncate_deepseek_prompt(self, prompt: str) -> str:
         if self.deepseek_max_prompt_chars <= 0 or len(prompt) <= self.deepseek_max_prompt_chars:
             return prompt
-        # Keep both the task/state header and the final action/score contract;
-        # dropping only the middle is safer than cutting off the transition
-        # or the output instructions.
+
+        def truncate_middle(value: str, limit: int) -> str:
+            if limit <= 0:
+                return ""
+            if len(value) <= limit:
+                return value
+            marker = "\n...[truncated]...\n"
+            if limit <= len(marker):
+                return value[:limit]
+            content_budget = limit - len(marker)
+            head = content_budget // 2
+            tail = content_budget - head
+            return value[:head] + marker + value[-tail:]
+
+        # The action is the highest-priority portion: otherwise distinct
+        # transitions can collapse to one cache key and receive the same label.
+        # Preserve its complete block whenever it fits, plus both ends of the
+        # before/after context (task header, nearby states, rubric and contract).
         budget = self.deepseek_max_prompt_chars
-        head = budget // 2
-        tail = budget - head
-        return f"{prompt[:head]}\n...[prompt truncated]...\n{prompt[-tail:]}"
+        action_start = prompt.find("[a_t: assistant action]")
+        action_end = prompt.find("[Observed immediate reward]", action_start + 1)
+        if action_start < 0 or action_end < 0:
+            return truncate_middle(prompt, budget)
+
+        prefix = prompt[:action_start]
+        action_block = prompt[action_start:action_end]
+        suffix = prompt[action_end:]
+        kept_action = (
+            action_block
+            if len(action_block) <= budget
+            else truncate_middle(action_block, budget)
+        )
+        remaining = max(budget - len(kept_action), 0)
+        prefix_limit = remaining // 3
+        suffix_limit = remaining - prefix_limit
+        return (
+            truncate_middle(prefix, prefix_limit)
+            + kept_action
+            + truncate_middle(suffix, suffix_limit)
+        )
 
     @staticmethod
     def _classify_api_error(exc: BaseException) -> str:
@@ -1166,6 +1258,7 @@ class FrozenGenerativeCritic:
         semaphore: asyncio.Semaphore,
         client: Optional[Any] = None,
         request_stats: Optional[DeepSeekRequestStats] = None,
+        fatal_auth_event: Optional[asyncio.Event] = None,
     ) -> DeepSeekGenerationResult:
         """Generate one critic response, returning text/retries/error-kind."""
         if request_stats is None:
@@ -1176,8 +1269,12 @@ class FrozenGenerativeCritic:
         retries = 0
         attempts = 1 + self.deepseek_max_retries
         for attempt in range(attempts):
+            if fatal_auth_event is not None and fatal_auth_event.is_set():
+                return DeepSeekGenerationResult("", retries, "auth_aborted")
             try:
                 async with semaphore:
+                    if fatal_auth_event is not None and fatal_auth_event.is_set():
+                        return DeepSeekGenerationResult("", retries, "auth_aborted")
                     # Increment only after acquiring the concurrency slot. A
                     # task canceled while waiting on the semaphore never made
                     # an HTTP request and must not inflate cost metrics.
@@ -1239,6 +1336,8 @@ class FrozenGenerativeCritic:
             except Exception as exc:  # noqa: BLE001 - SDK exception types vary by version
                 last_kind = self._classify_api_error(exc)
                 request_stats.record_error(last_kind)
+                if last_kind == "auth" and fatal_auth_event is not None:
+                    fatal_auth_event.set()
                 if attempt >= attempts - 1 or not self._is_retryable_api_error(exc):
                     return DeepSeekGenerationResult("", retries, last_kind)
                 retries += 1
@@ -1262,13 +1361,17 @@ class FrozenGenerativeCritic:
             future.cancel()
             raise TimeoutError("DeepSeek transport exceeded the synchronous safety deadline") from exc
 
-    def _deepseek_sync_timeout(self) -> float:
+    def _deepseek_sync_timeout(self, request_count: int = 1) -> float:
         """Bound the sync bridge even if a transport ignores cancellation."""
         if self.deepseek_batch_timeout > 0:
             return self.deepseek_batch_timeout + self.deepseek_timeout + 5.0
+        waves = max(
+            1,
+            math.ceil(max(int(request_count), 1) / self.deepseek_max_concurrency),
+        )
         request_budget = self.deepseek_timeout * (self.deepseek_max_retries + 1)
         backoff_budget = sum(min(2.0**attempt, 8.0) + 0.25 for attempt in range(self.deepseek_max_retries))
-        return request_budget + backoff_budget + 5.0
+        return waves * request_budget + backoff_budget + 5.0
 
     def _deepseek_cache_key(self, prompt: str) -> str:
         """Return a stable, non-sensitive cache key for one request."""
@@ -1301,7 +1404,7 @@ class FrozenGenerativeCritic:
             not self.deepseek_cache_enable
             or self.deepseek_cache_size <= 0
             or not value
-            or self._parse_score_optional(value) is None
+            or self._parse_api_score_optional(value) is None
         ):
             return
         self._deepseek_cache[key] = value
@@ -1400,10 +1503,12 @@ class FrozenGenerativeCritic:
                 f"max_concurrency={self.deepseek_max_concurrency} model={self.deepseek_model}"
             )
 
+        request_stats = [DeepSeekRequestStats() for _ in unique_prompts]
+
         async def run_batch() -> List[str]:
             client = self._get_deepseek_client()
             semaphore = asyncio.Semaphore(self.deepseek_max_concurrency)
-            request_stats = [DeepSeekRequestStats() for _ in unique_prompts]
+            fatal_auth_event = asyncio.Event()
             tasks = [
                 asyncio.create_task(
                     self._generate_one_deepseek(
@@ -1411,23 +1516,33 @@ class FrozenGenerativeCritic:
                         semaphore,
                         client,
                         request_stats=stats,
+                        fatal_auth_event=fatal_auth_event,
                     )
                 )
                 for prompt, stats in zip(unique_prompts, request_stats, strict=True)
             ]
             timed_out_indices: set[int] = set()
-            if self.deepseek_batch_timeout > 0:
-                _, pending = await asyncio.wait(tasks, timeout=self.deepseek_batch_timeout)
-                if pending:
-                    task_indices = {task: index for index, task in enumerate(tasks)}
-                    timed_out_indices = {task_indices[task] for task in pending}
-                    for task in pending:
-                        task.cancel()
+            try:
+                if self.deepseek_batch_timeout > 0:
+                    _, pending = await asyncio.wait(tasks, timeout=self.deepseek_batch_timeout)
+                    if pending:
+                        task_indices = {task: index for index, task in enumerate(tasks)}
+                        timed_out_indices = {task_indices[task] for task in pending}
+                        for task in pending:
+                            task.cancel()
 
-            # Gather the full ordered task list after the deadline check.  This
-            # preserves completed results and drains cancellations without
-            # leaking tasks into the next PPO step.
-            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Gather the full ordered task list after the deadline check.
+                # This preserves completed results and drains cancellations.
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            except BaseException:
+                # The synchronous bridge can cancel this coroutine. Explicitly
+                # drain every child so no HTTP task survives into the next PPO
+                # batch and exceeds the configured global concurrency.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             results: List[DeepSeekGenerationResult] = []
             for index, result in enumerate(raw_results):
                 if index in timed_out_indices:
@@ -1449,6 +1564,9 @@ class FrozenGenerativeCritic:
             auth_count = 0
             rate_limit_count = 0
             timeout_count = 0
+            server_count = 0
+            connection_count = 0
+            empty_response_count = 0
             input_token_count = 0
             output_token_count = 0
             usage_reported_request_count = 0
@@ -1463,6 +1581,9 @@ class FrozenGenerativeCritic:
                 auth_count += multiplicity * stats.error_counts.get("auth", 0)
                 rate_limit_count += multiplicity * stats.error_counts.get("rate_limit", 0)
                 timeout_count += multiplicity * stats.error_counts.get("timeout", 0)
+                server_count += multiplicity * stats.error_counts.get("server", 0)
+                connection_count += multiplicity * stats.error_counts.get("connection", 0)
+                empty_response_count += multiplicity * stats.error_counts.get("empty_response", 0)
                 if result.error_kind is not None:
                     failure_count += multiplicity
                     unique_failure_count += 1
@@ -1482,6 +1603,9 @@ class FrozenGenerativeCritic:
                     "gen_critic/api_auth_failure_count": float(auth_count),
                     "gen_critic/api_rate_limit_count": float(rate_limit_count),
                     "gen_critic/api_timeout_count": float(timeout_count),
+                    "gen_critic/api_server_failure_count": float(server_count),
+                    "gen_critic/api_connection_failure_count": float(connection_count),
+                    "gen_critic/api_empty_response_count": float(empty_response_count),
                     "gen_critic/api_missing_key": 0.0,
                     "gen_critic/api_batch_failed": float(failure_count == len(prompt_list)),
                     "gen_critic/api_batch_timeout_count": float(batch_timeout_count),
@@ -1511,7 +1635,7 @@ class FrozenGenerativeCritic:
         try:
             generated_outputs = self._run_async_from_sync(
                 run_batch,
-                timeout=self._deepseek_sync_timeout(),
+                timeout=self._deepseek_sync_timeout(len(unique_prompts)),
             )
             # Fill all duplicate positions and cache only successful text.
             for key, output in zip(unique_keys, generated_outputs, strict=True):
@@ -1539,20 +1663,32 @@ class FrozenGenerativeCritic:
             failed_prompt_count = len(prompt_list) - cache_hits
             count = float(max(failed_prompt_count, 1))
             unique_count = float(len(unique_prompts))
+            http_attempt_count = sum(stats.http_attempts for stats in request_stats)
+            retry_count = sum(stats.retries for stats in request_stats)
+            actual_request_count = sum(stats.http_attempts > 0 for stats in request_stats)
+            error_totals = {
+                error_kind: sum(stats.error_counts.get(error_kind, 0) for stats in request_stats)
+                for error_kind in ("auth", "rate_limit", "timeout", "server", "connection", "empty_response")
+            }
             self._last_generation_metadata.update(
                 {
                     "gen_critic/api_failure_count": float(failed_prompt_count),
                     "gen_critic/api_failure_rate": float(failed_prompt_count) / float(max(len(prompt_list), 1)),
                     "gen_critic/api_unique_failure_count": unique_count,
-                    "gen_critic/api_retry_count": 0.0,
-                    "gen_critic/api_auth_failure_count": count if kind == "auth" else 0.0,
-                    "gen_critic/api_rate_limit_count": count if kind == "rate_limit" else 0.0,
-                    "gen_critic/api_timeout_count": count if kind == "timeout" else 0.0,
+                    "gen_critic/api_retry_count": float(retry_count),
+                    "gen_critic/api_auth_failure_count": float(error_totals["auth"] or (count if kind == "auth" else 0.0)),
+                    "gen_critic/api_rate_limit_count": float(error_totals["rate_limit"] or (count if kind == "rate_limit" else 0.0)),
+                    "gen_critic/api_timeout_count": float(error_totals["timeout"] or (count if kind == "timeout" else 0.0)),
+                    "gen_critic/api_server_failure_count": float(error_totals["server"]),
+                    "gen_critic/api_connection_failure_count": float(error_totals["connection"]),
+                    "gen_critic/api_empty_response_count": float(error_totals["empty_response"]),
                     "gen_critic/api_missing_key": 1.0 if not self.deepseek_api_key else 0.0,
                     "gen_critic/api_batch_failed": float(cache_hits == 0),
                     "gen_critic/api_cache_hit_count": float(cache_hits),
-                    "gen_critic/api_request_count": 0.0,
+                    "gen_critic/api_request_count": float(actual_request_count),
+                    "gen_critic/api_scheduled_request_count": float(len(unique_prompts)),
                     "gen_critic/api_deduplicated_count": float(deduplicated_count),
+                    "gen_critic/api_http_attempt_count": float(http_attempt_count),
                 }
             )
             self._record_deepseek_efficiency_metrics(
@@ -1560,8 +1696,9 @@ class FrozenGenerativeCritic:
                 prompt_count=len(prompt_list),
                 cache_hits=cache_hits,
                 deduplicated_count=deduplicated_count,
-                request_count=0,
-                retry_count=0,
+                request_count=actual_request_count,
+                retry_count=retry_count,
+                http_attempt_count=http_attempt_count,
             )
             if self.deepseek_raise_on_error:
                 raise
@@ -1574,6 +1711,8 @@ class FrozenGenerativeCritic:
             return self._generate_texts_with_deepseek(prompts)
 
         self._reset_generation_metadata()
+        if not prompts:
+            return []
 
         if self.backend in {"actor_rollout_vllm", "vllm_actor_rollout", "actor_vllm", "vllm"}:
             if self._generate_fn is None:
@@ -1667,36 +1806,51 @@ class FrozenGenerativeCritic:
         if not self.enabled:
             return torch.zeros_like(label_tensor), {"gen_critic/enabled": 0.0}, []
 
+        expected_pairs = {
+            (sample_index, int(turn_id))
+            for sample_index in range(turn_ids.shape[0])
+            for turn_id in torch.unique(turn_ids[sample_index][turn_ids[sample_index] >= 0]).tolist()
+        }
         prompt_items = self.build_judge_prompts(messages_list=messages_list, turn_ids=turn_ids)
-        if len(prompt_items) == 0:
-            return label_tensor, {
-                "gen_critic/enabled": 1.0,
-                "gen_critic/num_prompts": 0.0,
-                "gen_critic/parse_fail_rate": 0.0,
-                "gen_critic/true_rate": 0.0,
-            }, []
+        actual_pairs = {(item.sample_index, item.turn_id) for item in prompt_items}
+        missing_prompt_count = len(expected_pairs - actual_pairs)
+        covered_prompt_count = len(expected_pairs & actual_pairs)
+        forced_items = [item for item in prompt_items if item.forced_score is not None]
+        request_items = [item for item in prompt_items if item.forced_score is None]
 
-        outputs = self._generate_texts([item.prompt for item in prompt_items])
+        request_outputs = list(self._generate_texts([item.prompt for item in request_items]))
+        if len(request_outputs) < len(request_items):
+            request_outputs.extend([""] * (len(request_items) - len(request_outputs)))
+        elif len(request_outputs) > len(request_items):
+            request_outputs = request_outputs[: len(request_items)]
+        request_output_by_pair = {
+            (item.sample_index, item.turn_id): output
+            for item, output in zip(request_items, request_outputs, strict=True)
+        }
+        outputs = [
+            "" if item.forced_score is not None else request_output_by_pair[(item.sample_index, item.turn_id)]
+            for item in prompt_items
+        ]
 
-        parse_fail = 0
+        parse_fail = missing_prompt_count
         positive_count = 0
         neutral_count = 0
-        negative_count = 0
+        negative_count = missing_prompt_count
         printed = 0
         # A malformed/missing API response is represented by an empty string
-        # and deliberately receives the negative fallback score -1.  Pad a
-        # malformed backend response list rather than crashing the whole
-        # rollout; each missing item is then handled identically.
-        outputs = list(outputs)
-        if len(outputs) < len(prompt_items):
-            outputs.extend([""] * (len(prompt_items) - len(outputs)))
-        elif len(outputs) > len(prompt_items):
-            outputs = outputs[: len(prompt_items)]
+        # and deliberately receives the negative fallback score -1. Protocol
+        # violations are already assigned -1 without paying for an API call.
 
         is_api_backend = self.backend in {"deepseek_api", "deepseek"}
         scores: List[int] = []
         for item, text in zip(prompt_items, outputs, strict=True):
-            parsed_score = self._parse_score_optional(text)
+            parsed_score = item.forced_score
+            if parsed_score is None:
+                parsed_score = (
+                    self._parse_api_score_optional(text)
+                    if is_api_backend
+                    else self._parse_score_optional(text)
+                )
             if parsed_score is None and not is_api_backend:
                 # Legacy local/rollout critics may still emit a bare boolean;
                 # keep that path usable while enforcing strict integers for
@@ -1730,16 +1884,28 @@ class FrozenGenerativeCritic:
                 print(f"[PARSED] score={score}")
                 printed += 1
 
-        num_prompts = float(len(prompt_items))
+        expected_num_prompts = float(len(expected_pairs))
+        submitted_num_prompts = float(len(prompt_items))
         metrics = {
             "gen_critic/enabled": 1.0,
-            "gen_critic/num_prompts": num_prompts,
-            "gen_critic/parse_fail_rate": float(parse_fail) / max(num_prompts, 1.0),
-            "gen_critic/true_rate": float(positive_count) / max(num_prompts, 1.0),
-            "gen_critic/positive_rate": float(positive_count) / max(num_prompts, 1.0),
-            "gen_critic/neutral_rate": float(neutral_count) / max(num_prompts, 1.0),
-            "gen_critic/negative_rate": float(negative_count) / max(num_prompts, 1.0),
-            "gen_critic/score_mean": float(sum(scores)) / max(num_prompts, 1.0),
+            "gen_critic/num_prompts": expected_num_prompts,
+            "gen_critic/constructed_prompt_count": submitted_num_prompts,
+            "gen_critic/submitted_prompt_count": float(len(request_items)),
+            "gen_critic/rule_forced_negative_count": float(len(forced_items)),
+            "gen_critic/missing_prompt_count": float(missing_prompt_count),
+            "gen_critic/prompt_coverage_rate": (
+                float(covered_prompt_count) / expected_num_prompts
+                if expected_num_prompts > 0
+                else 1.0
+            ),
+            "gen_critic/parse_fail_rate": float(parse_fail) / max(expected_num_prompts, 1.0),
+            "gen_critic/true_rate": float(positive_count) / max(expected_num_prompts, 1.0),
+            "gen_critic/positive_rate": float(positive_count) / max(expected_num_prompts, 1.0),
+            "gen_critic/neutral_rate": float(neutral_count) / max(expected_num_prompts, 1.0),
+            "gen_critic/negative_rate": float(negative_count) / max(expected_num_prompts, 1.0),
+            "gen_critic/score_mean": (
+                float(sum(scores) - missing_prompt_count) / max(expected_num_prompts, 1.0)
+            ),
         }
         metrics.update(self._generation_metadata_snapshot())
         return label_tensor, metrics, outputs

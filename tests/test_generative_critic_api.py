@@ -19,6 +19,7 @@ import torch
 from omegaconf import OmegaConf
 
 from ragen.trainer.generative_critic import DeepSeekBatchRequestError, FrozenGenerativeCritic
+from ragen.trainer.agent_trainer import validate_deepseek_batch_health
 
 
 def _config(**critic_overrides):
@@ -214,6 +215,34 @@ def test_cache_and_dedupe_use_the_actual_truncated_prompt():
     assert critic._last_generation_metadata["gen_critic/api_cache_hit_rate"] == 1.0
 
 
+def test_structured_prompt_truncation_preserves_action_and_contract():
+    critic = FrozenGenerativeCritic(_config(deepseek_max_prompt_chars=800))
+
+    def make_prompt(action):
+        return critic._build_single_prompt(
+            state_before="before" * 3000,
+            action_text=action,
+            state_after="after" * 3000,
+            observed_reward="0",
+            turn_number=1,
+            has_after_state=True,
+            env_instruction="solve" * 1000,
+            critic_instruction="Judge Sokoban progress." * 500,
+            response_format="score_only",
+        )
+
+    left = critic._truncate_deepseek_prompt(make_prompt("ACTION_LEFT"))
+    right = critic._truncate_deepseek_prompt(make_prompt("ACTION_RIGHT"))
+
+    assert len(left) <= 800
+    assert len(right) <= 800
+    assert "ACTION_LEFT" in left
+    assert "ACTION_RIGHT" in right
+    assert "FINAL_SCORE: -1" in left
+    assert left != right
+    assert critic._deepseek_cache_key(left) != critic._deepseek_cache_key(right)
+
+
 def test_persistent_loop_and_owned_client_are_reused_and_closed(monkeypatch):
     import openai
 
@@ -303,6 +332,18 @@ def test_nonpositive_batch_deadline_is_disabled():
 
     assert critic._generate_texts(["wait-for-result"]) == ["FINAL_SCORE: 0"]
     assert critic._last_generation_metadata["gen_critic/api_batch_timeout"] == 0.0
+
+
+def test_disabled_batch_deadline_sync_guard_accounts_for_all_concurrency_waves():
+    critic = FrozenGenerativeCritic(
+        _config(
+            deepseek_batch_timeout=0,
+            deepseek_timeout=1,
+            deepseek_max_retries=0,
+            deepseek_max_concurrency=1,
+        )
+    )
+    assert critic._deepseek_sync_timeout(request_count=40) == pytest.approx(45.0)
 
 
 def test_malformed_api_output_is_not_cached():
@@ -428,14 +469,16 @@ def test_concurrent_callers_keep_their_own_generation_metrics():
     assert results == [(1, 1.0), (2, 2.0)]
 
 
-def _messages(action: str):
+def _messages(action: str, **assistant_metadata):
+    assistant = {"role": "assistant", "content": action}
+    assistant.update(assistant_metadata)
     return [
         {"role": "system", "content": "Solve the task."},
         {
             "role": "user",
             "content": "Turn 0\nState:\nbefore\nYou have 1 action.",
         },
-        {"role": "assistant", "content": action},
+        assistant,
     ]
 
 
@@ -461,6 +504,102 @@ def test_infer_turn_labels_uses_signed_scores_and_api_failure_is_negative():
     assert scores[:, 1].tolist() == [1.0, 0.0, -1.0]
     assert metrics["gen_critic/parse_fail_rate"] == pytest.approx(1 / 3)
     assert len(outputs) == 3
+
+
+@pytest.mark.parametrize(
+    "malformed_output",
+    [
+        "###label: True",
+        "1",
+        "answer: 1",
+        "<answer>1</answer>",
+        "analysis only\n1.",
+    ],
+)
+def test_api_inference_rejects_and_does_not_cache_noncontract_output(malformed_output):
+    critic = FrozenGenerativeCritic(_config())
+    fake = _FakeClient(lambda kwargs: malformed_output)
+    critic._deepseek_client = fake
+    turn_ids = torch.zeros((1, 2), dtype=torch.long)
+
+    first_scores, first_metrics, _ = critic.infer_turn_labels(
+        [_messages("ACTION")],
+        turn_ids,
+    )
+    second_scores, second_metrics, _ = critic.infer_turn_labels(
+        [_messages("ACTION")],
+        turn_ids,
+    )
+
+    assert first_scores.tolist() == [[-1.0, -1.0]]
+    assert second_scores.tolist() == [[-1.0, -1.0]]
+    assert first_metrics["gen_critic/parse_fail_rate"] == 1.0
+    assert second_metrics["gen_critic/parse_fail_rate"] == 1.0
+    assert len(fake.chat.completions.calls) == 2
+
+
+def test_missing_judge_prompt_is_reported_and_rejected_before_update():
+    critic = FrozenGenerativeCritic(_config())
+    critic._deepseek_client = _FakeClient(lambda kwargs: "FINAL_SCORE: -1")
+    turn_ids = torch.zeros((2, 2), dtype=torch.long)
+
+    scores, metrics, outputs = critic.infer_turn_labels(
+        [_messages("ACTION"), [{"role": "user", "content": "no assistant"}]],
+        turn_ids,
+    )
+
+    assert scores.tolist() == [[-1.0, -1.0], [-1.0, -1.0]]
+    assert len(outputs) == 1
+    assert metrics["gen_critic/missing_prompt_count"] == 1.0
+    assert metrics["gen_critic/prompt_coverage_rate"] == 0.5
+    assert metrics["gen_critic/parse_fail_rate"] == 0.5
+    with pytest.raises(RuntimeError, match="prompt coverage"):
+        validate_deepseek_batch_health(metrics)
+
+
+def test_noncontiguous_requested_turn_ids_map_to_matching_assistant_turns():
+    critic = FrozenGenerativeCritic(_config())
+    messages = [
+        {"role": "system", "content": "Solve."},
+        {"role": "user", "content": "Turn 0\nState:\ns0\nYou have 3 actions."},
+        {"role": "assistant", "content": "ACTION_0"},
+        {"role": "user", "content": "Turn 1\nState:\ns1\nYou have 2 actions."},
+        {"role": "assistant", "content": "ACTION_1"},
+        {"role": "user", "content": "Turn 2\nState:\ns2\nYou have 1 action."},
+        {"role": "assistant", "content": "ACTION_2"},
+    ]
+    turn_ids = torch.tensor([[0, 2, -1]], dtype=torch.long)
+
+    items = critic.build_judge_prompts([messages], turn_ids)
+
+    assert [(item.sample_index, item.turn_id) for item in items] == [(0, 0), (0, 2)]
+    assert "ACTION_0" in items[0].prompt
+    assert "ACTION_2" in items[1].prompt
+    assert "ACTION_1" not in items[0].prompt + items[1].prompt
+
+
+def test_protocol_violation_is_forced_negative_without_api_request():
+    critic = FrozenGenerativeCritic(_config())
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: 1")
+    critic._deepseek_client = fake
+    turn_ids = torch.zeros((1, 2), dtype=torch.long)
+
+    scores, metrics, _ = critic.infer_turn_labels(
+        [
+            _messages(
+                "Left",
+                raw_content="<answer>Left | Right</answer>",
+                judge_force_negative=True,
+                judge_force_reason="max_actions_per_turn_exceeded",
+            )
+        ],
+        turn_ids,
+    )
+
+    assert scores.tolist() == [[-1.0, -1.0]]
+    assert metrics["gen_critic/rule_forced_negative_count"] == 1.0
+    assert metrics["gen_critic/parse_fail_rate"] == 0.0
+    assert fake.chat.completions.calls == []
 
 
 def test_missing_api_key_preserves_batch_shape_and_reports_failure(monkeypatch):

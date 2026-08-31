@@ -206,8 +206,21 @@ VAL_GROUP_SIZE="${VAL_GROUP_SIZE:-4}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
 TOTAL_STEPS="${TOTAL_STEPS:-2000}"
-MAX_TURN="${MAX_TURN:-5}"
 MAX_ACTIONS_PER_TURN="${MAX_ACTIONS_PER_TURN:-1}"
+MAX_ACTIONS_PER_TRAJ="${MAX_ACTIONS_PER_TRAJ:-10}"
+if [[ ! "${MAX_ACTIONS_PER_TURN}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${MAX_ACTIONS_PER_TRAJ}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_ACTIONS_PER_TURN and MAX_ACTIONS_PER_TRAJ must be positive integers" >&2
+    exit 2
+fi
+MAX_TURN="${MAX_TURN:-$(((MAX_ACTIONS_PER_TRAJ + MAX_ACTIONS_PER_TURN - 1) / MAX_ACTIONS_PER_TURN))}"
+if [[ ! "${MAX_TURN}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_TURN must be a positive integer" >&2
+    exit 2
+fi
+if (( MAX_ACTIONS_PER_TRAJ > MAX_TURN * MAX_ACTIONS_PER_TURN )); then
+    echo "MAX_ACTIONS_PER_TRAJ exceeds MAX_TURN * MAX_ACTIONS_PER_TURN" >&2
+    exit 2
+fi
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-40}"
 DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-v4-flash}"
 
@@ -294,6 +307,7 @@ TRAIN_ARGS=(
     "generative_critic.debug_print_samples=${DEBUG_CRITIC:-False}"
     "agent_proxy.max_turn=${MAX_TURN}"
     "agent_proxy.max_actions_per_turn=${MAX_ACTIONS_PER_TURN}"
+    "custom_envs.CoordSokoban.max_actions_per_traj=${MAX_ACTIONS_PER_TRAJ}"
     "agent_proxy.enable_think=${ENABLE_THINK:-False}"
     "agent_proxy.debug_turn_boundary=${DEBUG_TURN_BOUNDARY:-False}"
     "model_path=${MODEL_PATH}"

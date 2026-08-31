@@ -152,15 +152,6 @@ class ActorRolloutRefWorker(VerlActorRolloutRefWorker):
                 else:
                     output = self.rollout.generate_sequences(prompts=prompts)
 
-            if self._is_actor and mode in {"singleturn", "multiturn-end"}:
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                loop.run_until_complete(self.trainer_mode())
-                log_gpu_memory_usage("After switch to trainer mode", logger=logger)
-
             # We calculate the average timing across all ranks
             # to make sure meta_info["timing"] is the same
             timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
@@ -176,6 +167,19 @@ class ActorRolloutRefWorker(VerlActorRolloutRefWorker):
             )
             output.meta_info["timing"] = timing_generate
             output = output.to("cpu")
+
+        # An early-finished multi-turn rollout sends a skip_generation end
+        # marker solely to restore the hybrid engine. Keep this transition
+        # outside the real-generation branch so the actor always returns to
+        # trainer weights/cache state before log-prob computation and updates.
+        if self._is_actor and mode in {"singleturn", "multiturn-end"}:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.trainer_mode())
+            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         if should_empty_cache:
             torch.cuda.empty_cache()

@@ -125,6 +125,8 @@ def validate_deepseek_batch_health(
     missing_key = float(metrics.get("gen_critic/api_missing_key", 0.0))
     failure_rate = float(metrics.get("gen_critic/api_failure_rate", 0.0))
     parse_fail_rate = float(metrics.get("gen_critic/parse_fail_rate", 0.0))
+    missing_prompts = float(metrics.get("gen_critic/missing_prompt_count", 0.0))
+    prompt_coverage = float(metrics.get("gen_critic/prompt_coverage_rate", 1.0))
 
     reasons: list[str] = []
     if abort_on_auth_failure and (auth_failures > 0.0 or missing_key > 0.0):
@@ -133,10 +135,40 @@ def validate_deepseek_batch_health(
         reasons.append(f"API failure rate {failure_rate:.3f} > {max_failure_rate:.3f}")
     if max_parse_fail_rate >= 0.0 and parse_fail_rate > max_parse_fail_rate:
         reasons.append(f"parse failure rate {parse_fail_rate:.3f} > {max_parse_fail_rate:.3f}")
+    if missing_prompts > 0.0 or prompt_coverage < 1.0:
+        reasons.append(
+            f"judge prompt coverage {prompt_coverage:.3f} with {missing_prompts:.0f} missing action(s)"
+        )
     if reasons:
         raise RuntimeError(
             "DeepSeek judge batch rejected before actor update: " + "; ".join(reasons)
         )
+
+
+def validation_rollout_seed(config, validation_step: int) -> int:
+    """Return a stable, non-overlapping validation seed block."""
+    base_seed = OmegaConf.select(config, "seed.val", default=123)
+    if base_seed is None:
+        base_seed = 123
+    env_groups = int(OmegaConf.select(config, "es_manager.val.env_groups", default=1))
+    if env_groups <= 0:
+        raise ValueError("es_manager.val.env_groups must be positive")
+    if validation_step < 0:
+        raise ValueError("validation_step must be non-negative")
+    return int(base_seed) + int(validation_step) * env_groups
+
+
+def training_rollout_seed(config, global_step: int) -> int:
+    """Return the deterministic training seed block for a checkpoint step."""
+    base_seed = OmegaConf.select(config, "seed.train", default=None)
+    if base_seed is None:
+        raise ValueError("seed.train must be set for resumable agent training")
+    env_groups = int(OmegaConf.select(config, "es_manager.train.env_groups", default=1))
+    if env_groups <= 0:
+        raise ValueError("es_manager.train.env_groups must be positive")
+    if global_step <= 0:
+        raise ValueError("training global_step must be positive")
+    return int(base_seed) + (int(global_step) - 1) * env_groups
 
 
 def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> DataProto:
@@ -1240,7 +1272,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             # pad to be divisible by dp_size
             import time
             start_time = time.time()
-            test_batch = self.agent_proxy.rollout(test_gen_batch, val=True)
+            test_batch = self.agent_proxy.rollout(
+                test_gen_batch,
+                val=True,
+                seed=validation_rollout_seed(self.config, step),
+            )
             end_time = time.time()
             print(f"validation generation time: {end_time - start_time} seconds")
             for key, value in test_batch.meta_info["metrics"].items():
@@ -1611,7 +1647,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             with marked_timer("step", timing_raw):
                 # generate a batch
                 with marked_timer("gen", timing_raw):
-                    batch = self.agent_proxy.rollout(batch, val=False)
+                    batch = self.agent_proxy.rollout(
+                        batch,
+                        val=False,
+                        seed=training_rollout_seed(self.config, self.global_steps),
+                    )
                     critic_train_batch = deepcopy(batch) if self.use_trainable_generative_critic else None
 
                     # Filter first, then adjust batch size
@@ -1651,7 +1691,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     with marked_timer("gen_max", timing_raw):
                         gen_baseline_batch = deepcopy(batch)
                         gen_baseline_batch.meta_info["do_sample"] = False
-                        gen_baseline_output = self.agent_proxy.rollout(gen_baseline_batch, val=False)
+                        gen_baseline_output = self.agent_proxy.rollout(
+                            gen_baseline_batch,
+                            val=False,
+                            seed=training_rollout_seed(self.config, self.global_steps),
+                        )
 
                         batch = batch.union(gen_baseline_output)
                         reward_baseline_tensor = self.reward_fn(batch)

@@ -1,10 +1,15 @@
 import numpy as np
 import torch
 from tensordict import TensorDict
+from omegaconf import OmegaConf
 
 from verl import DataProto
 
-from ragen.trainer.agent_trainer import adjust_batch
+from ragen.trainer.agent_trainer import (
+    adjust_batch,
+    training_rollout_seed,
+    validation_rollout_seed,
+)
 
 
 def _batch(size: int) -> DataProto:
@@ -39,3 +44,31 @@ def test_adjust_batch_delete_keeps_tensor_and_non_tensor_rows_aligned():
         strict=True,
     ):
         assert name == f"row-{row_id}"
+
+
+def test_validation_rollout_seeds_are_fixed_non_overlapping_blocks():
+    config = OmegaConf.create(
+        {
+            "seed": {"val": 123},
+            "es_manager": {"val": {"env_groups": 16}},
+        }
+    )
+
+    first_checkpoint = [validation_rollout_seed(config, step) for step in range(3)]
+    second_checkpoint = [validation_rollout_seed(config, step) for step in range(3)]
+
+    assert first_checkpoint == [123, 139, 155]
+    assert second_checkpoint == first_checkpoint
+
+
+def test_training_rollout_seed_is_resume_stable():
+    config = OmegaConf.create(
+        {
+            "seed": {"train": 10000},
+            "es_manager": {"train": {"env_groups": 16}},
+        }
+    )
+
+    assert training_rollout_seed(config, 1) == 10000
+    assert training_rollout_seed(config, 51) == 10800
+    assert training_rollout_seed(config, 51) == training_rollout_seed(config, 51)

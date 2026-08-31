@@ -67,14 +67,27 @@ def _label_only_config():
                     "entropy_coeff": 0.0,
                     "use_kl_loss": False,
                 },
-                "rollout": {"rollout_filter_ratio": 1.0},
+                "rollout": {"rollout_filter_ratio": 1.0, "n": 1},
             },
             "agent_proxy": {
                 "context_window_mode": "full",
                 "max_turn": 5,
+                "max_actions_per_turn": 1,
                 "use_turn_scores": False,
             },
-            "es_manager": {"train": {"env_groups": 4, "group_size": 8}},
+            "es_manager": {
+                "train": {
+                    "env_groups": 4,
+                    "group_size": 8,
+                    "env_configs": {"tags": ["Puzzle"]},
+                },
+                "val": {
+                    "env_groups": 2,
+                    "group_size": 2,
+                    "env_configs": {"tags": ["Puzzle"]},
+                },
+            },
+            "custom_envs": {"Puzzle": {"max_actions_per_traj": 5}},
             "algorithm": {
                 "bi_level_gae": False,
                 "adv_estimator": "gae",
@@ -101,6 +114,31 @@ def test_label_only_config_accepts_exact_unregularized_judge_advantage():
     config = add_dependency_and_validate_config(_label_only_config())
 
     assert config.data.train_batch_size == 32
+
+
+def test_config_rejects_environment_budget_larger_than_rollout_capacity():
+    config = _label_only_config()
+    config.custom_envs.Puzzle.max_actions_per_traj = 6
+
+    with pytest.raises(ValueError, match=r"Puzzle.*6.*capacity.*5"):
+        add_dependency_and_validate_config(config)
+
+
+def test_config_checks_validation_only_environment_budget():
+    config = _label_only_config()
+    config.custom_envs.ValPuzzle = {"max_actions_per_traj": 6}
+    config.es_manager.val.env_configs.tags = ["ValPuzzle"]
+
+    with pytest.raises(ValueError, match=r"ValPuzzle.*capacity"):
+        add_dependency_and_validate_config(config)
+
+
+def test_exact_turn_ppo_rejects_rollout_level_repetition():
+    config = _label_only_config()
+    config.actor_rollout_ref.rollout.n = 2
+
+    with pytest.raises(ValueError, match=r"rollout\.n=1"):
+        add_dependency_and_validate_config(config)
 
 
 @pytest.mark.parametrize(

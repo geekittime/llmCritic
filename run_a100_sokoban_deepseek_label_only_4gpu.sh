@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four-GPU diagnostic run: each turn advantage is exactly DeepSeek's -1/0/1 label.
+# A100 launch profile: each turn advantage is exactly DeepSeek's -1/0/1 label.
 set -euo pipefail
 umask 077
 
@@ -10,7 +10,7 @@ if [[ "${LLM_CRITIC_GPUS_RESERVED:-0}" != "1" ]]; then
     exit 2
 fi
 
-: "${CUDA_DEVICES:?Set four explicitly reserved GPU IDs, for example 4,5,6,7}"
+: "${CUDA_DEVICES:?Set two or four explicitly reserved GPU IDs, for example 6,7}"
 export CUDA_DEVICES
 export SECRETS_FILE="${SECRETS_FILE-${HOME}/.config/llm-critic/secrets.env}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -21,6 +21,12 @@ export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-advantage-ablation}"
 # the full model stack in one idle worker per host CPU at startup.
 export RAY_NUM_CPUS="${RAY_NUM_CPUS:-16}"
 export RAY_WORKER_NICENESS="${RAY_WORKER_NICENESS:-0}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+# Keep Ray's session files off a nearly full shared /data mount. The socket
+# root must also remain short enough for Unix-domain socket path limits.
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/${USER:-ksj}-lc-rt}"
+export TMPDIR="${TMPDIR:-/tmp/${USER:-ksj}-lc-tmp}"
 
 # Both A100 hosts expose the working DeepSeek egress proxy on localhost:7890.
 # W&B endpoints stay direct so artifact uploads do not contend with judge calls.
@@ -33,8 +39,8 @@ export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,api.wandb.ai,wandb
 export no_proxy="${NO_PROXY}"
 
 IFS=',' read -r -a gpu_ids <<< "${CUDA_DEVICES}"
-if (( ${#gpu_ids[@]} != 4 )); then
-    echo "This profile requires exactly four CUDA devices." >&2
+if (( ${#gpu_ids[@]} != 2 && ${#gpu_ids[@]} != 4 )); then
+    echo "This profile requires exactly two or four CUDA devices." >&2
     exit 2
 fi
 
@@ -59,11 +65,6 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
         fi
     done
 
-    data_available_kib="$(df -Pk /data | awk 'NR==2 {print $4}')"
-    if (( data_available_kib < 80 * 1024 * 1024 )); then
-        echo "Refusing to train with less than 80 GiB free on /data." >&2
-        exit 2
-    fi
 fi
 
 export TRAIN_ENV_GROUPS="${TRAIN_ENV_GROUPS:-4}"
@@ -72,9 +73,15 @@ export VAL_ENV_GROUPS="${VAL_ENV_GROUPS:-16}"
 export VAL_GROUP_SIZE="${VAL_GROUP_SIZE:-2}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
-export TOTAL_STEPS="${TOTAL_STEPS:-200}"
-export MAX_TURN="${MAX_TURN:-5}"
+export TOTAL_STEPS="${TOTAL_STEPS:-100}"
+export MAX_ACTIONS_PER_TRAJ="${MAX_ACTIONS_PER_TRAJ:-10}"
 export MAX_ACTIONS_PER_TURN="${MAX_ACTIONS_PER_TURN:-1}"
+# Preserve the original ten primitive-action Sokoban horizon after changing to
+# one action per assistant turn. The shared launcher derives MAX_TURN=10 unless
+# callers explicitly choose a shorter, consistently advertised ablation.
+if [[ -n "${MAX_TURN:-}" ]]; then
+    export MAX_TURN
+fi
 export RESPONSE_LENGTH="${RESPONSE_LENGTH:-40}"
 
 export TURN_ADVANTAGE_MODE=label_only
@@ -95,9 +102,9 @@ export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.50}"
 # default 1024-sequence scheduler allocation; shared hosts may additionally set
 # VLLM_ENFORCE_EAGER=True to skip CUDA-graph compilation and capture.
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-32}"
-export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-False}"
-export ACTOR_USE_TORCH_COMPILE="${ACTOR_USE_TORCH_COMPILE:-True}"
-export ACTOR_FSDP_USE_TORCH_COMPILE="${ACTOR_FSDP_USE_TORCH_COMPILE:-True}"
+export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-True}"
+export ACTOR_USE_TORCH_COMPILE="${ACTOR_USE_TORCH_COMPILE:-False}"
+export ACTOR_FSDP_USE_TORCH_COMPILE="${ACTOR_FSDP_USE_TORCH_COMPILE:-False}"
 export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-12288}"
 export USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 export USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
@@ -115,12 +122,27 @@ export DEEPSEEK_MAX_TOKENS="${DEEPSEEK_MAX_TOKENS:-8}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 # Evaluate 32 fixed rollouts every ten optimizer steps.
 export TEST_FREQ="${TEST_FREQ:-10}"
-export SAVE_FREQ="${SAVE_FREQ:-50}"
+export SAVE_FREQ="${SAVE_FREQ:-${TOTAL_STEPS}}"
 
 host_tag="$(hostname -s | tr -d '\n' | tr -c 'A-Za-z0-9_.-' '_')"
 run_stamp="$(date +%Y%m%d-%H%M%S)"
-export RUN_NAME="${RUN_NAME:-${host_tag}-sokoban-turnppo-dsflash-labelonly-4gpu-${run_stamp}}"
-export CHECKPOINT_DIR="${CHECKPOINT_DIR:-/data/kangshijia/checkpoints/${WANDB_PROJECT}/${RUN_NAME}}"
+export RUN_NAME="${RUN_NAME:-${host_tag}-sokoban-turnppo-dsflash-labelonly-${#gpu_ids[@]}gpu-${run_stamp}}"
+export CHECKPOINT_DIR="${CHECKPOINT_DIR:-${HOME}/checkpoints/${WANDB_PROJECT}/${RUN_NAME}}"
 export MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-1}"
+
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    min_checkpoint_free_gib="${MIN_CHECKPOINT_FREE_GIB:-50}"
+    if [[ ! "${min_checkpoint_free_gib}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "MIN_CHECKPOINT_FREE_GIB must be a positive integer." >&2
+        exit 2
+    fi
+    checkpoint_parent="$(dirname "${CHECKPOINT_DIR}")"
+    mkdir -p "${checkpoint_parent}"
+    checkpoint_available_kib="$(df -Pk "${checkpoint_parent}" | awk 'NR==2 {print $4}')"
+    if (( checkpoint_available_kib < min_checkpoint_free_gib * 1024 * 1024 )); then
+        echo "Refusing to train with less than ${min_checkpoint_free_gib} GiB free on the checkpoint filesystem." >&2
+        exit 2
+    fi
+fi
 
 exec bash "${ROOT_DIR}/train_sokoban_deepseek_turn_ppo.sh"

@@ -191,10 +191,10 @@ class LLMAgentProxy:
 
         return lm_outputs
 
-    def rollout(self, dataproto: DataProto, val=False):
+    def rollout(self, dataproto: DataProto, val=False, seed: Optional[int] = None):
         es_manager = self.val_es_manager if val else self.train_es_manager
         ctx_manager = self.val_ctx_manager if val else self.train_ctx_manager
-        env_outputs = es_manager.reset()
+        env_outputs = es_manager.reset(seed=seed)
 
         max_turn = self.config.agent_proxy.max_turn
         multi_turn = max_turn > 1
@@ -207,8 +207,10 @@ class LLMAgentProxy:
             np.zeros(len(env_outputs)),
         )  # to calculate instance-level entropy
 
+        exhausted_turn_budget = True
         for i in range(max_turn):
             if len(env_outputs) == 0:
+                exhausted_turn_budget = False
                 break
             lm_inputs: DataProto = ctx_manager.get_lm_inputs(
                 env_outputs, prepare_for_update=False
@@ -244,6 +246,7 @@ class LLMAgentProxy:
             env_inputs: List[Dict] = ctx_manager.get_env_inputs(lm_outputs)
             env_outputs: List[Dict] = es_manager.step(env_inputs)
             if len(env_outputs) == 0:  # all finished
+                exhausted_turn_budget = False
                 if multi_turn and not finalized and last_inputs is not None:
                     last_inputs.meta_info["skip_generation"] = True
                     last_inputs.meta_info["mode"] = "multiturn-end"
@@ -255,6 +258,8 @@ class LLMAgentProxy:
             last_inputs.meta_info["skip_generation"] = True
             last_inputs.meta_info["mode"] = "multiturn-end"
             self.generate_sequences(last_inputs)
+        if exhausted_turn_budget:
+            es_manager.finalize_unfinished(reason="max_turn")
         rollout_states = es_manager.get_rollout_states()
         rollouts = ctx_manager.formulate_rollouts(rollout_states)
 

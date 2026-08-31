@@ -16,6 +16,7 @@ register_resolvers()
 import sys
 import socket
 import stat
+from omegaconf import OmegaConf
 from ragen.utils import redact_config
 
 
@@ -73,6 +74,50 @@ def _load_task_credentials(path_value):
         # An explicitly selected protected file must override stale inherited
         # credentials, especially after key rotation.
         os.environ[name] = value
+
+
+def _validate_rollout_action_budgets(config) -> None:
+    """Reject prompts that advertise more actions than rollout can execute."""
+    max_turn = int(OmegaConf.select(config, "agent_proxy.max_turn", default=0) or 0)
+    max_actions_per_turn = int(
+        OmegaConf.select(config, "agent_proxy.max_actions_per_turn", default=0) or 0
+    )
+    if max_turn <= 0 or max_actions_per_turn <= 0:
+        raise ValueError(
+            "agent_proxy.max_turn and max_actions_per_turn must both be positive integers"
+        )
+    rollout_capacity = max_turn * max_actions_per_turn
+
+    custom_envs = OmegaConf.select(config, "custom_envs", default=None)
+    es_manager = OmegaConf.select(config, "es_manager", default=None)
+    if custom_envs is None or es_manager is None:
+        return
+
+    checked: set[str] = set()
+    for mode in ("train", "val"):
+        mode_config = OmegaConf.select(config, f"es_manager.{mode}", default=None)
+        if mode_config is None:
+            continue
+        tags = OmegaConf.select(mode_config, "env_configs.tags", default=[]) or []
+        for raw_tag in tags:
+            tag = str(raw_tag)
+            if tag in checked:
+                continue
+            checked.add(tag)
+            env_config = custom_envs.get(tag)
+            if env_config is None:
+                raise ValueError(f"es_manager.{mode} selects unknown custom_env tag {tag!r}")
+            env_budget = int(env_config.get("max_actions_per_traj", 0) or 0)
+            if env_budget <= 0:
+                raise ValueError(
+                    f"custom_envs.{tag}.max_actions_per_traj must be a positive integer"
+                )
+            if env_budget > rollout_capacity:
+                raise ValueError(
+                    f"custom_envs.{tag}.max_actions_per_traj={env_budget} exceeds rollout "
+                    f"capacity agent_proxy.max_turn * max_actions_per_turn={rollout_capacity}; "
+                    "the model would be promised actions that cannot be executed"
+                )
 
 class DummyRewardManager():
     """The reward manager.
@@ -186,6 +231,7 @@ def get_custom_reward_fn(config):
 def add_dependency_and_validate_config(config):
 
     # validate config
+    _validate_rollout_action_budgets(config)
     assert config.micro_batch_size_per_gpu * config.trainer.n_gpus_per_node <= config.actor_rollout_ref.actor.ppo_mini_batch_size, \
         f"micro_batch_size_per_gpu * n_gpus_per_node ({config.micro_batch_size_per_gpu * config.trainer.n_gpus_per_node}) must be less than or equal to ppo_mini_batch_size ({config.actor_rollout_ref.actor.ppo_mini_batch_size})"
     assert config.actor_rollout_ref.actor.ppo_mini_batch_size % (config.micro_batch_size_per_gpu * config.trainer.n_gpus_per_node) == 0, \
@@ -216,6 +262,11 @@ def add_dependency_and_validate_config(config):
             "so each sampled turn can retain exact prompt/response token IDs"
         )
     if use_turn_ppo:
+        if int(config.actor_rollout_ref.rollout.n) != 1:
+            raise ValueError(
+                "Exact turn PPO requires actor_rollout_ref.rollout.n=1; environment "
+                "group_size already controls repeated trajectories"
+            )
         turn_advantage_mode = str(config.algorithm.get("turn_advantage_mode", "weighted"))
         if turn_advantage_mode not in {"weighted", "label_only"}:
             raise ValueError(

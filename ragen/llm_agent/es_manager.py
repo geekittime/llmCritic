@@ -131,7 +131,7 @@ class EnvStateManager:
                 seed = 123 if self.base_seed is None else self.base_seed
         else:
             if self.mode == "train" and self.base_seed is not None:
-                self.seed_counter = seed - self.base_seed + 1
+                self.seed_counter = seed - self.base_seed + self.env_groups
         seeds = _expand_seed(seed)
 
         def _reset_single(entry, single_seed):
@@ -202,7 +202,7 @@ class EnvStateManager:
                 pass
             return acc_reward, turn_info, turn_done, executed_actions
 
-        def _log_env_state(status, history, cur_obs, max_actions_per_traj, executed_actions, all_actions, acc_reward, turn_done, turn_info, env_input):
+        def _log_env_state(status, history, cur_obs, max_actions_per_traj, executed_actions, acc_reward, turn_done, turn_info, env_input):
             obs = self._handle_mm_state(cur_obs)
             status.num_actions += len(executed_actions)
             status.rewards.append(acc_reward) # NOTE use turn-wise acc_reward
@@ -212,7 +212,15 @@ class EnvStateManager:
                 status.truncated = not turn_info.get('success', False)
             action_record = {
                 'actions': executed_actions, 'reward': acc_reward, 'info': turn_info,
-                'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response']
+                'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response'],
+                'executed_action_texts': list(env_input.get('executed_action_texts', [])),
+                'response_format_valid': bool(env_input.get('response_format_valid', True)),
+                'action_format_valid': bool(env_input.get('action_format_valid', True)),
+                'action_count_exceeded': bool(env_input.get('action_count_exceeded', False)),
+                'manager_invalid_action': bool(env_input.get('manager_invalid_action', False)),
+                'trajectory_action_truncated': bool(env_input.get('trajectory_action_truncated', False)),
+                'judge_force_negative': bool(env_input.get('judge_force_negative', False)),
+                'judge_force_reason': str(env_input.get('judge_force_reason', '')),
             }
             for trace_key in ("prompt_token_ids", "response_token_ids"):
                 if trace_key in env_input:
@@ -237,17 +245,42 @@ class EnvStateManager:
             actions_left_before = entry['max_actions_per_traj'] - entry['status'].num_actions
 
             # execute actions in envs
-            valid_actions = self._extract_map_valid_actions(entry, env_input['actions'])
+            valid_action_pairs = self._extract_map_valid_action_pairs(entry, env_input['actions'])
+            valid_actions = [mapped for mapped, _ in valid_action_pairs]
+            valid_action_texts = [text for _, text in valid_action_pairs]
             acc_reward, turn_info, turn_done, executed_actions = _execute_actions(env, valid_actions[:actions_left_before])
+            executed_action_texts = valid_action_texts[:len(executed_actions)]
             no_manager_action = len(valid_actions) == 0
             penalty_delta = 0.0
-            if len(valid_actions) != len(env_input['actions']) or not valid_actions:
+            manager_invalid_action = len(valid_actions) != len(env_input['actions']) or not valid_actions
+            trajectory_action_truncated = len(valid_actions) > max(actions_left_before, 0)
+            if manager_invalid_action:
                 penalty_delta = self.sys_config.es_manager.format_penalty
             if no_manager_action:
                 turn_info = dict(turn_info)
                 turn_info['manager_invalid_action'] = True
 
-            status, history = _log_env_state(entry['status'], self.rollout_cache[env_id]['history'], entry['env'].render(), entry['max_actions_per_traj'], executed_actions, valid_actions, acc_reward, turn_done, turn_info, env_input)
+            violation_reasons = []
+            if not bool(env_input.get('response_format_valid', True)):
+                violation_reasons.append('invalid_response_format')
+            if not bool(env_input.get('action_format_valid', True)):
+                violation_reasons.append('invalid_action_format')
+            if bool(env_input.get('action_count_exceeded', False)):
+                violation_reasons.append('max_actions_per_turn_exceeded')
+            if manager_invalid_action:
+                violation_reasons.append('invalid_or_missing_action')
+            if trajectory_action_truncated:
+                violation_reasons.append('trajectory_action_budget_exceeded')
+            env_input = dict(env_input)
+            env_input.update({
+                'executed_action_texts': executed_action_texts,
+                'manager_invalid_action': manager_invalid_action,
+                'trajectory_action_truncated': trajectory_action_truncated,
+                'judge_force_negative': bool(violation_reasons),
+                'judge_force_reason': ','.join(violation_reasons),
+            })
+
+            status, history = _log_env_state(entry['status'], self.rollout_cache[env_id]['history'], entry['env'].render(), entry['max_actions_per_traj'], executed_actions, acc_reward, turn_done, turn_info, env_input)
             if no_manager_action and history:
                 history[-1]['manager_invalid_action'] = True
             if status.num_actions >= entry['max_actions_per_traj'] and not turn_done:
@@ -296,6 +329,20 @@ class EnvStateManager:
 
         return env_outputs
 
+    def finalize_unfinished(self, reason: str = "max_turn") -> None:
+        """Mark episodes still active when the outer rollout loop is exhausted."""
+        if self.rollout_cache is None:
+            return
+        for entry, cache in zip(self.envs, self.rollout_cache, strict=True):
+            status = entry["status"]
+            if status.terminated or status.truncated:
+                continue
+            # EnvStateManager historically uses terminated=True for every done
+            # episode and distinguishes failure with truncated=True.
+            status.terminated = True
+            status.truncated = True
+            cache["termination_reason"] = str(reason)
+
     def get_rollout_states(self):
         """Get the final output for all environment"""
         envs = self.envs
@@ -308,6 +355,9 @@ class EnvStateManager:
             env_metric = {
                 'success': float(status.terminated and (not status.truncated)),
                 'num_actions': status.num_actions,
+                'trajectory_terminated': float(status.terminated),
+                'trajectory_truncated': float(status.truncated),
+                'turn_budget_exhausted': float(cache.get('termination_reason') == 'max_turn'),
             }
 
             try:
@@ -394,17 +444,23 @@ class EnvStateManager:
         history.append(entry)
         return history
 
-    def _extract_map_valid_actions(self, entry: Dict, actions: List[str]):
-        """extract valid actions from the action lookup table (if exists)"""
-        mapped_actions = []
+    def _extract_map_valid_action_pairs(self, entry: Dict, actions: List[str]):
+        """Return environment actions paired with canonical human-readable names."""
         action_lookup = getattr(entry['env'].config, 'action_lookup', None)
         if action_lookup is None:
-            mapped_actions = actions
-        else: # the envs have pre-defined action lookup
-            rev_action_lookup = {v.lower(): k for k, v in action_lookup.items()}
-            actions = [action.lower() for action in actions]
-            mapped_actions = [rev_action_lookup[action] for action in actions if action in rev_action_lookup]
-        return mapped_actions
+            return [(action, str(action)) for action in actions]
+
+        rev_action_lookup = {str(value).lower(): key for key, value in action_lookup.items()}
+        pairs = []
+        for action in actions:
+            mapped = rev_action_lookup.get(str(action).lower())
+            if mapped is not None:
+                pairs.append((mapped, str(action_lookup[mapped])))
+        return pairs
+
+    def _extract_map_valid_actions(self, entry: Dict, actions: List[str]):
+        """Compatibility wrapper returning only mapped environment actions."""
+        return [mapped for mapped, _ in self._extract_map_valid_action_pairs(entry, actions)]
     
     def _handle_mm_state(self, state: Union[str, np.ndarray, list[np.ndarray]]):
         """Handle the state from the environment

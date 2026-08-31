@@ -33,6 +33,7 @@ def dummy_config():
             "enable_think": False,
             "use_turn_scores": False,
             "action_sep": "|",
+            "max_actions_per_turn": 1,
             "reward_normalization": {
                 "grouping": "batch",
                 "method": "identity"
@@ -88,3 +89,40 @@ def test_context_window_truncation(dummy_config):
     assert "S1" not in str(messages)
     assert "S2" in str(messages)
     assert "S3" in str(messages)
+
+
+def test_response_parser_flags_extra_actions_and_unparsed_suffix(dummy_config):
+    ctx = ContextManager(config=dummy_config, tokenizer=DummyTokenizer(), mode="train")
+
+    canonical, actions, metadata = ctx._parse_response(
+        "<answer>Left | Right</answer>"
+    )
+    assert canonical == "<answer>Left</answer>"
+    assert actions == ["Left"]
+    assert metadata["response_format_valid"] is True
+    assert metadata["action_count_exceeded"] is True
+    assert metadata["raw_action_count"] == 2
+
+    raw = "<answer>Left</answer> trailing text"
+    canonical, actions, metadata = ctx._parse_response(raw)
+    assert canonical == raw
+    assert actions == []
+    assert metadata["response_format_valid"] is False
+
+    canonical, actions, metadata = ctx._parse_response("<answer>Left |</answer>")
+    assert actions == ["Left"]
+    assert metadata["action_format_valid"] is False
+
+    canonical, actions, metadata = ctx._parse_response(
+        "<answer>Left</answer><answer>Right</answer>"
+    )
+    assert metadata["action_format_valid"] is False
+
+
+def test_prompt_budget_and_single_action_instruction_match_real_rollout(dummy_config):
+    dummy_config.actor_rollout_ref.rollout.response_length = 40
+    dummy_config.custom_envs.sokoban.max_tokens = 120
+    ctx = ContextManager(config=dummy_config, tokenizer=DummyTokenizer(), mode="train")
+
+    assert ctx.env_config_lookup[0]["max_tokens"] == 40
+    assert "exactly one valid action" in ctx.prefix_lookup[0]
