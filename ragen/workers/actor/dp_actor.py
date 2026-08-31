@@ -183,6 +183,53 @@ def compute_turn_micro_batch_scale(
     )
 
 
+_TURN_POLICY_METRIC_KEYS = (
+    "actor/pg_loss",
+    "actor/pg_clipfrac",
+    "actor/ppo_kl",
+    "actor/pg_clipfrac_lower",
+)
+
+
+def finalize_turn_policy_metrics(
+    metric_sums: dict[str, float],
+    turn_weight: float,
+    *,
+    collective_device: torch.device | None = None,
+) -> dict[str, float]:
+    """Return exact turn-weighted actor metrics across all data-parallel ranks."""
+    if turn_weight <= 0:
+        raise ValueError("turn metric weight must be positive")
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if collective_device is None:
+        if distributed:
+            device_name = get_device_name()
+            collective_device = (
+                torch.device(device_name, get_device_id())
+                if device_name != "cpu"
+                else torch.device("cpu")
+            )
+        else:
+            collective_device = torch.device("cpu")
+
+    packed = torch.tensor(
+        [*(float(metric_sums[key]) for key in _TURN_POLICY_METRIC_KEYS), float(turn_weight)],
+        dtype=torch.float64,
+        device=collective_device,
+    )
+    if distributed:
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+
+    global_weight = float(packed[-1].item())
+    if global_weight <= 0:
+        raise ValueError("global turn metric weight must be positive")
+    return {
+        key: float(packed[index].item()) / global_weight
+        for index, key in enumerate(_TURN_POLICY_METRIC_KEYS)
+    }
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -512,6 +559,8 @@ class DataParallelPPOActor(BasePPOActor):
                 raise ValueError("Turn PPO received a batch without any valid turn actions")
 
         metrics = {}
+        turn_metric_sums = {key: 0.0 for key in _TURN_POLICY_METRIC_KEYS}
+        turn_metric_weight = 0.0
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -614,6 +663,7 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    micro_turn_weight = None
                     if turn_ids is not None and turn_global_weight is not None:
                         # compute_turn_policy_loss returns a local weighted mean.
                         # Convert it to a weighted sum, then use one global
@@ -638,18 +688,36 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
-                    data = {
+                    actor_metrics = {
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
+                    if micro_turn_weight is not None:
+                        for key in _TURN_POLICY_METRIC_KEYS:
+                            turn_metric_sums[key] += actor_metrics[key] * micro_turn_weight
+                        turn_metric_weight += micro_turn_weight
+                    else:
+                        append_to_dict(metrics, actor_metrics)
                     if entropy_coeff != 0:
-                        data["actor/entropy_loss"] = entropy_loss.detach().item()
-                    append_to_dict(metrics, data)
+                        append_to_dict(
+                            metrics,
+                            {"actor/entropy_loss": entropy_loss.detach().item()},
+                        )
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
+        if turn_global_weight is not None:
+            exact_turn_metrics = finalize_turn_policy_metrics(
+                turn_metric_sums,
+                turn_metric_weight,
+            )
+            for key, value in exact_turn_metrics.items():
+                # Worker-group metric collation expects list-valued samples.
+                # Every rank receives the same all-reduced value, so the
+                # controller's final mean preserves the exact global result.
+                metrics[key] = [value]
         self.actor_optimizer.zero_grad()
         return metrics

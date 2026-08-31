@@ -25,6 +25,7 @@ from ragen.workers.actor.dp_actor import (
     DataParallelPPOActor,
     compute_turn_micro_batch_scale,
     compute_turn_policy_loss,
+    finalize_turn_policy_metrics,
 )
 from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
 from ragen.utils import redact_config
@@ -463,6 +464,76 @@ def test_inverse_multiplicity_weights_survive_multiple_optimizer_steps():
     # Two optimizer steps together carry two copies of the global mean. The
     # duplicated third row must not receive a full extra step of its own.
     assert torch.allclose(accumulated_loss, 2.0 * full_loss)
+
+
+def test_turn_policy_metrics_weight_dynamic_microbatches_and_copied_rows():
+    micro_metrics = [
+        {
+            "actor/pg_loss": 1.0,
+            "actor/pg_clipfrac": 0.0,
+            "actor/ppo_kl": 0.2,
+            "actor/pg_clipfrac_lower": 0.4,
+        },
+        {
+            "actor/pg_loss": 5.0,
+            "actor/pg_clipfrac": 1.0,
+            "actor/ppo_kl": 0.8,
+            "actor/pg_clipfrac_lower": 0.1,
+        },
+    ]
+    # The first dynamic micro-batch contains one half-weight padding copy;
+    # the second contains two original turns plus its matching half-copy.
+    micro_weights = [0.5, 2.5]
+    metric_sums = {
+        key: sum(values[key] * weight for values, weight in zip(micro_metrics, micro_weights, strict=True))
+        for key in micro_metrics[0]
+    }
+
+    metrics = finalize_turn_policy_metrics(metric_sums, sum(micro_weights))
+
+    for key in micro_metrics[0]:
+        expected = sum(
+            values[key] * weight
+            for values, weight in zip(micro_metrics, micro_weights, strict=True)
+        ) / sum(micro_weights)
+        assert metrics[key] == pytest.approx(expected)
+    assert metrics["actor/pg_loss"] != pytest.approx(3.0)
+
+
+def test_turn_policy_metrics_sum_unequal_fsdp_rank_weights(monkeypatch):
+    local_sums = {
+        "actor/pg_loss": 1.0,
+        "actor/pg_clipfrac": 0.25,
+        "actor/ppo_kl": 0.5,
+        "actor/pg_clipfrac_lower": 0.75,
+    }
+    local_weight = 1.0
+    remote_packed = torch.tensor(
+        [9.0, 2.25, 4.5, 6.75, 3.0],
+        dtype=torch.float64,
+    )
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def fake_all_reduce(packed, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        packed.add_(remote_packed)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    metrics = finalize_turn_policy_metrics(
+        local_sums,
+        local_weight,
+        collective_device=torch.device("cpu"),
+    )
+
+    assert metrics == {
+        "actor/pg_loss": pytest.approx(2.5),
+        "actor/pg_clipfrac": pytest.approx(0.625),
+        "actor/ppo_kl": pytest.approx(1.25),
+        "actor/pg_clipfrac_lower": pytest.approx(1.875),
+    }
 
 
 def test_zero_entropy_coefficient_uses_placeholder_without_entropy_reduction(monkeypatch):
