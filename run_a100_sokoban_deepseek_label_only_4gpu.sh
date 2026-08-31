@@ -17,6 +17,10 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_ENTITY="${WANDB_ENTITY:-MuLab-RL}"
 export WANDB_PROJECT="${WANDB_PROJECT:-llm-critic-turn-ppo}"
 export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-advantage-ablation}"
+# The trainer needs only a handful of Ray actors. Prevent Ray from importing
+# the full model stack in one idle worker per host CPU at startup.
+export RAY_NUM_CPUS="${RAY_NUM_CPUS:-16}"
+export RAY_WORKER_NICENESS="${RAY_WORKER_NICENESS:-0}"
 
 # Both A100 hosts expose the working DeepSeek egress proxy on localhost:7890.
 # W&B endpoints stay direct so artifact uploads do not contend with judge calls.

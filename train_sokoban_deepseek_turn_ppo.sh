@@ -75,6 +75,15 @@ export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARN}"
 # This is a single-node launcher. Never inherit a pointer to another user's
 # persistent Ray cluster on a shared host.
 unset RAY_ADDRESS
+if [[ -n "${RAY_WORKER_NICENESS:-}" ]]; then
+    if [[ ! "${RAY_WORKER_NICENESS}" =~ ^([0-9]|1[0-9])$ ]]; then
+        echo "RAY_WORKER_NICENESS must be an integer from 0 through 19" >&2
+        exit 2
+    fi
+    # Ray's default worker niceness is 15. A bounded worker pool can use the
+    # caller-selected normal priority without flooding a shared CPU host.
+    export RAY_worker_niceness="${RAY_WORKER_NICENESS}"
+fi
 RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
 safe_run_name="$(printf '%s' "${RUN_NAME}" | tr -c 'A-Za-z0-9_.-' '_')"
 if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
@@ -210,6 +219,10 @@ if (( TRAIN_ENV_GROUPS * TRAIN_GROUP_SIZE < PPO_MINI_BATCH_SIZE )); then
     echo "TRAIN_ENV_GROUPS * TRAIN_GROUP_SIZE must be >= PPO_MINI_BATCH_SIZE" >&2
     exit 2
 fi
+if [[ -n "${RAY_NUM_CPUS:-}" && ! "${RAY_NUM_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RAY_NUM_CPUS must be a positive integer" >&2
+    exit 2
+fi
 
 # A fresh run is the default; set RESUME_MODE=auto/resume_path explicitly when
 # continuing a known checkpoint.  ``DRY_RUN=1`` asks Hydra to render the fully
@@ -295,6 +308,10 @@ TRAIN_ARGS=(
     "algorithm.gamma=${GAMMA:-1.0}"
     "algorithm.lam=${LAMBDA:-0.95}"
 )
+
+if [[ -n "${RAY_NUM_CPUS:-}" ]]; then
+    TRAIN_ARGS+=("ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}")
+fi
 
 if [[ -n "${SECRETS_FILE:-}" ]]; then
     TRAIN_ARGS+=("generative_critic.deepseek_api_key_file=${SECRETS_FILE}")
