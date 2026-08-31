@@ -78,6 +78,21 @@ def _load_task_credentials(path_value):
 
 def _validate_rollout_action_budgets(config) -> None:
     """Reject prompts that advertise more actions than rollout can execute."""
+    max_model_len = OmegaConf.select(
+        config, "actor_rollout_ref.rollout.max_model_len", default=None
+    )
+    response_length = OmegaConf.select(
+        config, "actor_rollout_ref.rollout.response_length", default=None
+    )
+    if max_model_len is not None and response_length is not None:
+        max_model_len = int(max_model_len)
+        response_length = int(response_length)
+        if response_length <= 0 or max_model_len <= response_length:
+            raise ValueError(
+                "actor_rollout_ref.rollout.max_model_len must be greater than the positive "
+                "response_length so generation has a non-empty prompt budget"
+            )
+
     max_turn = int(OmegaConf.select(config, "agent_proxy.max_turn", default=0) or 0)
     max_actions_per_turn = int(
         OmegaConf.select(config, "agent_proxy.max_actions_per_turn", default=0) or 0

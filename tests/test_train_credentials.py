@@ -133,6 +133,15 @@ def test_config_checks_validation_only_environment_budget():
         add_dependency_and_validate_config(config)
 
 
+def test_config_rejects_response_length_that_consumes_model_context():
+    config = _label_only_config()
+    config.actor_rollout_ref.rollout.max_model_len = 40
+    config.actor_rollout_ref.rollout.response_length = 40
+
+    with pytest.raises(ValueError, match=r"max_model_len.*response_length"):
+        add_dependency_and_validate_config(config)
+
+
 def test_exact_turn_ppo_rejects_rollout_level_repetition():
     config = _label_only_config()
     config.actor_rollout_ref.rollout.n = 2

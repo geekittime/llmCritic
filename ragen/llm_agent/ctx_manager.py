@@ -583,10 +583,28 @@ class ContextManager:
                     mean_metrics["rollout/max_tile"] = int(np.max(tile_vals))
         except Exception:
             pass
+        binary_metric_suffixes = {
+            "success",
+            "trajectory_terminated",
+            "trajectory_truncated",
+            "turn_budget_exhausted",
+            "action_is_effective",
+            "action_is_valid",
+            "terminated",
+            "truncated",
+            "maxsteps_used",
+            "all_boxes_on_target",
+            "manager_invalid_action",
+            "end_of_page",
+        }
         for key, values in metrics.items():
             if not isinstance(values, list):
                 continue
             prefix, suffix = key.split("/", 1)
+            # A conditional mean over non-zero binary values is always 1 and
+            # therefore adds no information beyond the ordinary rate metric.
+            if suffix in binary_metric_suffixes or suffix.startswith("pass@"):
+                continue
             non_zero_values = [v for v in values if v != 0]
             if non_zero_values:
                 non_zero_key = f"{prefix}/non-zero/{suffix}"
@@ -594,6 +612,37 @@ class ContextManager:
 
         mean_metrics["response_length"] = response_length
         return mean_metrics
+
+    def _prompt_token_budget(self, add_generation_prompt: bool) -> Optional[int]:
+        """Return the largest safe prompt length for the rollout engine."""
+        max_model_len = getattr(self.config.actor_rollout_ref.rollout, "max_model_len", None)
+        if max_model_len is None:
+            return None
+
+        budget = int(max_model_len)
+        if add_generation_prompt:
+            max_new_tokens = int(self.config.actor_rollout_ref.rollout.response_length)
+            budget -= max_new_tokens
+            if budget <= 0:
+                raise ValueError(
+                    "actor_rollout_ref.rollout.max_model_len must exceed response_length "
+                    "so generation has a positive prompt budget"
+                )
+        return budget
+
+    def _render_messages_for_length(
+        self,
+        messages: List[Dict],
+        add_generation_prompt: bool,
+    ) -> str:
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+        )
+        if add_generation_prompt:
+            text += "<think>" if self.config.agent_proxy.enable_think else "<answer>"
+        return text
 
     def _apply_max_length(
         self,
@@ -611,16 +660,12 @@ class ContextManager:
         Returns:
             Truncated message list
         """
-        max_length = getattr(self.config.actor_rollout_ref.rollout, "max_model_len", None)
+        max_length = self._prompt_token_budget(add_generation_prompt)
         if max_length is None:
             return messages
 
         # Calculate current length
-        full_text = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False
-        )
+        full_text = self._render_messages_for_length(messages, add_generation_prompt)
         token_len = len(self.tokenizer(full_text, add_special_tokens=False)["input_ids"])
 
         if token_len <= max_length:
@@ -653,17 +698,13 @@ class ContextManager:
 
             # Recalculate length
             truncated = [system_msg] + conversation
-            full_text = self.tokenizer.apply_chat_template(
-                truncated,
-                add_generation_prompt=add_generation_prompt,
-                tokenize=False
-            )
+            full_text = self._render_messages_for_length(truncated, add_generation_prompt)
             token_len = len(self.tokenizer(full_text, add_special_tokens=False)["input_ids"])
 
         if token_len > max_length:
-            logging.warning(
-                f"Cannot truncate to {max_length} tokens (current: {token_len}). "
-                "Single turn may exceed max length."
+            raise ValueError(
+                f"Cannot truncate prompt to the safe {max_length}-token budget "
+                f"(current: {token_len}); the system prompt and current turn alone are too long"
             )
 
         return [system_msg] + conversation
@@ -731,7 +772,7 @@ class ContextManager:
         include_assistant: bool,
         add_generation_prompt: bool,
     ) -> int:
-        max_length = getattr(self.config.actor_rollout_ref.rollout, "max_model_len", None)
+        max_length = self._prompt_token_budget(add_generation_prompt)
         if max_length is None:
             return history_start
 

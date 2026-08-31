@@ -372,15 +372,14 @@ class EnvStateManager:
                 for k, v in turn.get('info', {}).items():
                     if k == 'success':
                         continue
-                    if k not in custom_metric:
-                        custom_metric[k] = []
                     try:
-                        custom_metric[k].append(float(v))
+                        numeric_value = float(v)
                     except (ValueError, TypeError):
-                        logging.warning(
-                            "Skipping non-numeric metric '%s' with value %r for env %s.",
-                            k, v, entry['tag']
-                        )
+                        # Environment info may contain categorical metadata such
+                        # as action names. It is useful for trajectory inspection
+                        # but must not become a fabricated scalar metric.
+                        continue
+                    custom_metric.setdefault(k, []).append(numeric_value)
             try:
                 if 'raw_reward' in custom_metric:
                     env_metric['episodic_return'] = float(np.sum(custom_metric['raw_reward']))

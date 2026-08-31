@@ -14,6 +14,7 @@ from ragen.trainer.agent_trainer import (
     broadcast_outcome_to_turns,
     collapse_turn_scores,
     compose_turn_advantages,
+    compute_exact_trace_observability_metrics,
     normalize_turn_scores,
     place_turn_endpoint_rewards,
     trajectory_outcomes,
@@ -47,6 +48,9 @@ def test_tracker_config_redacts_nested_credentials_without_mutating_input():
             "max_concurrency": 8,
         },
         "wandb_token": "wb-not-for-logs",
+        "tokenizer_path": "/models/tokenizer",
+        "max_tokens": 40,
+        "ppo_max_token_len_per_gpu": 12288,
     }
 
     redacted = redact_config(config)
@@ -56,7 +60,44 @@ def test_tracker_config_redacts_nested_credentials_without_mutating_input():
     assert redacted["generative_critic"]["deepseek_api_key_file"] == "<redacted>"
     assert redacted["wandb_token"] == "<redacted>"
     assert redacted["generative_critic"]["max_concurrency"] == 8
+    assert redacted["tokenizer_path"] == "/models/tokenizer"
+    assert redacted["max_tokens"] == 40
+    assert redacted["ppo_max_token_len_per_gpu"] == 12288
     assert config["generative_critic"]["deepseek_api_key"] == "sk-not-for-logs"
+
+
+def test_exact_trace_observability_uses_action_mask_not_shifted_sequence():
+    batch = DataProto(
+        batch=TensorDict(
+            {
+                "attention_mask": torch.tensor(
+                    [[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]],
+                    dtype=torch.long,
+                ),
+                "response_mask": torch.tensor(
+                    [[0, 0, 0, 0, 1, 1], [0, 1, 1, 1, 1, 1]],
+                    dtype=torch.float32,
+                ),
+                "sample_weights": torch.ones(2, dtype=torch.float32),
+            },
+            batch_size=2,
+        )
+    )
+
+    metrics = compute_exact_trace_observability_metrics(
+        batch,
+        {"gen": 14.0},
+        max_response_length=5,
+        max_model_len=10,
+    )
+
+    assert metrics["response_length/mean"] == pytest.approx(3.5)
+    assert metrics["response_length/max"] == pytest.approx(5.0)
+    assert metrics["response_length/clip_ratio"] == pytest.approx(0.5)
+    assert metrics["prompt_length/mean"] == pytest.approx(2.5)
+    assert metrics["prompt_length/max"] == pytest.approx(3.0)
+    assert metrics["perf/generated_action_tokens"] == pytest.approx(7.0)
+    assert metrics["timing_per_token_ms/gen"] == pytest.approx(2000.0)
 
 
 def test_token_trace_metadata_is_causal_aligned_and_left_padding_safe():

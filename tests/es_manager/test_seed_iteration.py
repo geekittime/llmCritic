@@ -128,3 +128,33 @@ def test_step_records_executed_action_and_forces_protocol_violation_negative():
     assert turn["action_count_exceeded"] is True
     assert turn["judge_force_negative"] is True
     assert turn["judge_force_reason"] == "max_actions_per_turn_exceeded"
+
+
+def test_rollout_metrics_ignore_categorical_info_without_empty_metric():
+    manager = object.__new__(EnvStateManager)
+    manager.group_size = 1
+    manager.envs = [
+        {
+            "tag": "Puzzle",
+            "group_id": 0,
+            "env": SimpleNamespace(),
+            "status": EnvStatus(terminated=True, truncated=False, num_actions=1),
+        }
+    ]
+    manager.rollout_cache = [
+        {
+            "tag": "Puzzle",
+            "group_id": 0,
+            "history": [
+                {"info": {"action.name": "push left", "raw_reward": 1.0}},
+                {"state": "done"},
+            ],
+        }
+    ]
+
+    states = manager.get_rollout_states()
+
+    assert "Puzzle/action.name" not in states[0]["metrics"]
+    assert states[0]["metrics"]["Puzzle/raw_reward"] == pytest.approx(1.0)
+    assert states[0]["metrics"]["Puzzle/episodic_return"] == pytest.approx(1.0)
+    assert states[0]["history"][-1]["metrics"] == {"raw_reward": [1.0]}

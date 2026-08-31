@@ -171,6 +171,100 @@ def training_rollout_seed(config, global_step: int) -> int:
     return int(base_seed) + (int(global_step) - 1) * env_groups
 
 
+def compute_exact_trace_observability_metrics(
+    batch: DataProto,
+    timing_raw: dict[str, float],
+    *,
+    max_response_length: int,
+    max_model_len: Optional[int],
+) -> dict[str, float]:
+    """Return length/timing metrics for RAGEN's shifted full-trace layout."""
+    response_mask = batch.batch["response_mask"].float()
+    attention_mask = batch.batch["attention_mask"].float()
+    if response_mask.ndim != 2 or attention_mask.ndim != 2:
+        raise ValueError("response_mask and attention_mask must be rank-2")
+    if attention_mask.shape[0] != response_mask.shape[0] or attention_mask.shape[1] != response_mask.shape[1] + 1:
+        raise ValueError(
+            "exact trace attention_mask must have one more token than response_mask; "
+            f"got {tuple(attention_mask.shape)} and {tuple(response_mask.shape)}"
+        )
+    if max_response_length <= 0:
+        raise ValueError("max_response_length must be positive")
+
+    response_lengths = response_mask.sum(dim=-1)
+    total_lengths = attention_mask.sum(dim=-1)
+    prompt_lengths = total_lengths - response_lengths
+    if torch.any(prompt_lengths < 0):
+        raise ValueError("response_mask contains more valid tokens than attention_mask")
+
+    sample_weights = batch.batch.get("sample_weights", None)
+    if sample_weights is None:
+        sample_weights = torch.ones_like(response_lengths)
+    else:
+        sample_weights = sample_weights.to(response_lengths.device, dtype=torch.float32).reshape(-1)
+    if sample_weights.shape != response_lengths.shape or torch.any(sample_weights < 0):
+        raise ValueError("sample_weights must be a non-negative vector matching the batch size")
+    total_weight = sample_weights.sum()
+    if total_weight <= 0:
+        raise ValueError("sample_weights must have positive total weight")
+
+    def weighted_mean(values: torch.Tensor, weights: torch.Tensor = sample_weights) -> float:
+        denominator = weights.sum()
+        if denominator <= 0:
+            return 0.0
+        return float((values.float() * weights).sum().div(denominator).item())
+
+    non_aborted = response_lengths > 0
+    non_aborted_weights = sample_weights * non_aborted.float()
+    if torch.any(non_aborted):
+        non_aborted_lengths = response_lengths[non_aborted]
+        non_aborted_mean = weighted_mean(response_lengths, non_aborted_weights)
+        non_aborted_max = float(non_aborted_lengths.max().item())
+        non_aborted_min = float(non_aborted_lengths.min().item())
+        non_aborted_clip = weighted_mean(
+            (response_lengths >= max_response_length).float(),
+            non_aborted_weights,
+        )
+    else:
+        non_aborted_mean = 0.0
+        non_aborted_max = 0.0
+        non_aborted_min = 0.0
+        non_aborted_clip = 0.0
+
+    prompt_budget = None
+    if max_model_len is not None:
+        prompt_budget = int(max_model_len) - int(max_response_length)
+        if prompt_budget <= 0:
+            raise ValueError("max_model_len must exceed max_response_length")
+
+    metrics = {
+        "response_length/mean": weighted_mean(response_lengths),
+        "response_length/max": float(response_lengths.max().item()),
+        "response_length/min": float(response_lengths.min().item()),
+        "response_length/clip_ratio": weighted_mean(
+            (response_lengths >= max_response_length).float()
+        ),
+        "response_length_non_aborted/mean": non_aborted_mean,
+        "response_length_non_aborted/max": non_aborted_max,
+        "response_length_non_aborted/min": non_aborted_min,
+        "response_length_non_aborted/clip_ratio": non_aborted_clip,
+        "response/aborted_ratio": weighted_mean((~non_aborted).float()),
+        "prompt_length/mean": weighted_mean(prompt_lengths),
+        "prompt_length/max": float(prompt_lengths.max().item()),
+        "prompt_length/min": float(prompt_lengths.min().item()),
+        "prompt_length/clip_ratio": (
+            weighted_mean((prompt_lengths >= prompt_budget).float())
+            if prompt_budget is not None
+            else 0.0
+        ),
+        "perf/generated_action_tokens": float((response_lengths * sample_weights).sum().item()),
+    }
+    generated_tokens = metrics["perf/generated_action_tokens"]
+    if "gen" in timing_raw and generated_tokens > 0:
+        metrics["timing_per_token_ms/gen"] = float(timing_raw["gen"] * 1000.0 / generated_tokens)
+    return metrics
+
+
 def adjust_batch(batch: DataProto, size_divisor: int, mode: str = "copy") -> DataProto:
     """
     Adjust batch size to be divisible by size_divisor.
@@ -2197,6 +2291,15 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             use_value_critic_metrics = self.use_critic and (not self.use_trainable_generative_critic)
             metrics.update(compute_data_metrics(batch=batch, use_critic=use_value_critic_metrics))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            if "trajectory_turn_ids" in batch.non_tensor_batch:
+                metrics.update(
+                    compute_exact_trace_observability_metrics(
+                        batch,
+                        timing_raw,
+                        max_response_length=int(self.config.actor_rollout_ref.rollout.response_length),
+                        max_model_len=self.config.actor_rollout_ref.rollout.max_model_len,
+                    )
+                )
             if self.use_trainable_generative_critic:
                 metrics["timing_s/critic_generation"] = critic_generation_time
                 actor_generation_time = timing_raw.get("gen", 0.0)
