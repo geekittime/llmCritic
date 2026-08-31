@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -111,9 +112,51 @@ def _label_only_config():
 
 
 def test_label_only_config_accepts_exact_unregularized_judge_advantage():
-    config = add_dependency_and_validate_config(_label_only_config())
+    with pytest.warns(RuntimeWarning, match="not GAE"):
+        config = add_dependency_and_validate_config(_label_only_config())
 
     assert config.data.train_batch_size == 32
+
+
+def test_config_rejects_non_neutral_deepseek_parse_fallback():
+    config = _label_only_config()
+    config.generative_critic.parse_fail_score = -1
+
+    with pytest.raises(ValueError, match="parse/API failures must map to neutral 0"):
+        add_dependency_and_validate_config(config)
+
+
+def test_config_validates_critic_audit_bounds_and_path(tmp_path):
+    config = _label_only_config()
+    config.generative_critic.audit_enable = True
+    config.generative_critic.audit_path = str(tmp_path / "critic.jsonl")
+    config.generative_critic.audit_sample_rate = 1.1
+
+    with pytest.raises(ValueError, match="audit_sample_rate"):
+        add_dependency_and_validate_config(config)
+
+
+def test_discounted_turn_credit_is_identified_as_return_not_gae():
+    config = _label_only_config()
+    config.algorithm.turn_credit_assignment = "discounted_return"
+
+    with pytest.warns(RuntimeWarning, match="not GAE"):
+        validated = add_dependency_and_validate_config(config)
+
+    assert validated.algorithm.turn_credit_assignment == "discounted_return"
+
+
+def test_launcher_uses_neutral_parse_fallback_and_bounded_audit():
+    launcher = Path(__file__).parents[1] / "train_sokoban_deepseek_turn_ppo.sh"
+    source = launcher.read_text(encoding="utf-8")
+
+    assert '"generative_critic.parse_fail_score=0"' in source
+    assert '"algorithm.turn_advantage_mode=${TURN_ADVANTAGE_MODE:-label_only}"' in source
+    assert '"algorithm.outcome_weight=${OUTCOME_WEIGHT:-0.0}"' in source
+    assert '"algorithm.outcome_broadcast=${OUTCOME_BROADCAST:-none}"' in source
+    assert "CRITIC_AUDIT_SAMPLE_RATE" in source
+    assert "CRITIC_AUDIT_MAX_RECORDS" in source
+    assert "TURN_CREDIT_ASSIGNMENT" in source
 
 
 def test_config_rejects_environment_budget_larger_than_rollout_capacity():

@@ -93,11 +93,13 @@ if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
     default_wandb_dir="/data/${USER}/wb/${safe_run_name}"
     default_tmp_dir="/data/${USER}/tmp/${safe_run_name}"
     default_cache_dir="/data/${USER}/cache"
+    default_critic_audit_path="/data/${USER}/logs/llm-critic/${safe_run_name}-critic-audit.jsonl"
 else
     default_ray_tmp="/tmp/${USER:-ragen}-rt"
     default_wandb_dir="/tmp/${USER:-ragen}-wb/${safe_run_name}"
     default_tmp_dir="/tmp/${USER:-ragen}-tmp/${safe_run_name}"
     default_cache_dir="/tmp/${USER:-ragen}-cache"
+    default_critic_audit_path="/tmp/${USER:-ragen}-logs/${safe_run_name}-critic-audit.jsonl"
 fi
 export RAY_TMPDIR="${RAY_TMPDIR:-${default_ray_tmp}}"
 ray_tmp_bytes="$(LC_ALL=C printf '%s' "${RAY_TMPDIR}" | wc -c)"
@@ -223,6 +225,23 @@ if (( MAX_ACTIONS_PER_TRAJ > MAX_TURN * MAX_ACTIONS_PER_TURN )); then
 fi
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-40}"
 DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-v4-flash}"
+TURN_CREDIT_ASSIGNMENT="${TURN_CREDIT_ASSIGNMENT:-direct}"
+if [[ "${TURN_CREDIT_ASSIGNMENT}" != "direct" && "${TURN_CREDIT_ASSIGNMENT}" != "discounted_return" ]]; then
+    echo "TURN_CREDIT_ASSIGNMENT must be direct or discounted_return" >&2
+    exit 2
+fi
+CRITIC_AUDIT_ENABLE="${CRITIC_AUDIT_ENABLE:-True}"
+if [[ "${CRITIC_AUDIT_ENABLE}" != "True" && "${CRITIC_AUDIT_ENABLE}" != "False" ]]; then
+    echo "CRITIC_AUDIT_ENABLE must be True or False" >&2
+    exit 2
+fi
+CRITIC_AUDIT_PATH="${CRITIC_AUDIT_PATH:-${default_critic_audit_path}}"
+CRITIC_AUDIT_SAMPLE_RATE="${CRITIC_AUDIT_SAMPLE_RATE:-0.10}"
+CRITIC_AUDIT_MAX_RECORDS="${CRITIC_AUDIT_MAX_RECORDS:-5000}"
+CRITIC_AUDIT_RAW_OUTPUT_MAX_CHARS="${CRITIC_AUDIT_RAW_OUTPUT_MAX_CHARS:-2000}"
+if [[ "${CRITIC_AUDIT_ENABLE}" == "True" ]]; then
+    mkdir -p "$(dirname "${CRITIC_AUDIT_PATH}")"
+fi
 
 if (( PPO_MINI_BATCH_SIZE % (MICRO_BATCH_SIZE * N_GPUS) != 0 )); then
     echo "PPO_MINI_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * N_GPUS" >&2
@@ -258,10 +277,14 @@ TRAIN_ARGS=(
     "micro_batch_size_per_gpu=${MICRO_BATCH_SIZE}"
     "algorithm.adv_estimator=gae"
     "algorithm.use_label_outcome_advantage=True"
-    "algorithm.turn_advantage_mode=${TURN_ADVANTAGE_MODE:-weighted}"
+    # This launcher is the DeepSeek-only ablation: each turn's advantage is
+    # exactly the parsed judge score. Override these values only for a named
+    # outcome-reward comparison run.
+    "algorithm.turn_advantage_mode=${TURN_ADVANTAGE_MODE:-label_only}"
+    "++algorithm.turn_credit_assignment=${TURN_CREDIT_ASSIGNMENT}"
     "algorithm.label_weight=${LABEL_WEIGHT:-1.0}"
-    "algorithm.outcome_weight=${OUTCOME_WEIGHT:-1.0}"
-    "algorithm.outcome_broadcast=${OUTCOME_BROADCAST:-all_turns}"
+    "algorithm.outcome_weight=${OUTCOME_WEIGHT:-0.0}"
+    "algorithm.outcome_broadcast=${OUTCOME_BROADCAST:-none}"
     "algorithm.normalize_turn_advantage=${NORMALIZE_TURN_ADVANTAGE:-False}"
     "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD:-False}"
     "algorithm.add_kl_to_turn_advantage=${ADD_KL_TO_TURN_ADVANTAGE:-True}"
@@ -301,10 +324,16 @@ TRAIN_ARGS=(
     "generative_critic.deepseek_max_failure_rate=${DEEPSEEK_MAX_FAILURE_RATE:-0.25}"
     "generative_critic.deepseek_max_parse_fail_rate=${DEEPSEEK_MAX_PARSE_FAIL_RATE:-0.25}"
     "generative_critic.deepseek_max_prompt_chars=${DEEPSEEK_MAX_PROMPT_CHARS:-12000}"
-    "generative_critic.parse_fail_score=-1"
+    "generative_critic.include_observed_reward=${INCLUDE_OBSERVED_REWARD:-False}"
+    "generative_critic.parse_fail_score=0"
     "generative_critic.default_label_if_parse_fail=False"
     "generative_critic.do_sample=False"
     "generative_critic.debug_print_samples=${DEBUG_CRITIC:-False}"
+    "++generative_critic.audit_enable=${CRITIC_AUDIT_ENABLE}"
+    "++generative_critic.audit_path='${CRITIC_AUDIT_PATH}'"
+    "++generative_critic.audit_sample_rate=${CRITIC_AUDIT_SAMPLE_RATE}"
+    "++generative_critic.audit_max_records=${CRITIC_AUDIT_MAX_RECORDS}"
+    "++generative_critic.audit_raw_output_max_chars=${CRITIC_AUDIT_RAW_OUTPUT_MAX_CHARS}"
     "agent_proxy.max_turn=${MAX_TURN}"
     "agent_proxy.max_actions_per_turn=${MAX_ACTIONS_PER_TURN}"
     "custom_envs.CoordSokoban.max_actions_per_traj=${MAX_ACTIONS_PER_TRAJ}"

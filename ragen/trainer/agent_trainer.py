@@ -3,9 +3,13 @@ FSDP PPO Trainer with Ray-based single controller.
 Adapted from the excellently written verl implementation.
 """
 
-import os
-import uuid
 import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import stat
+import uuid
 import ray
 import torch
 import numpy as np
@@ -58,8 +62,457 @@ from ragen.llm_agent.agent_proxy import LLMAgentProxy
 from ragen.utils import GenerationsLogger, redact_config
 from ragen.trainer.rollout_filter import build_rollout_filter
 from ragen.trainer.generative_critic import FrozenGenerativeCritic
+from ragen.trainer.turn_credit import assign_turn_credit
 
 from tensordict import TensorDict
+
+
+_AUDIT_SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE),
+    re.compile(
+        r"(?i)(\b(?:deepseek|wandb)[_-]?api[_-]?key\b\s*[:=]\s*)"
+        r"(?:['\"]?)[^\s,'\";]+"
+    ),
+    re.compile(r"(?i)(\bauthorization\b\s*[:=]\s*(?:bearer\s+)?)[^\s,'\";]+"),
+)
+
+_ACTION_TYPES = ("invalid", "no_op", "push", "move", "state_change", "unknown")
+_LABEL_NAMES = {-1: "negative", 0: "neutral", 1: "positive"}
+
+
+def _redact_critic_audit_text(value: Any, *, max_chars: int) -> str:
+    """Bound and redact untrusted judge/action text before it reaches disk."""
+    text = "" if value is None else str(value)
+    for pattern in _AUDIT_SECRET_PATTERNS:
+        if pattern.groups:
+            text = pattern.sub(lambda match: f"{match.group(1)}<redacted>", text)
+        else:
+            text = pattern.sub("<redacted>", text)
+    if len(text) > max_chars:
+        return text[:max_chars] + "...[truncated]"
+    return text
+
+
+def _normalise_state_for_comparison(state: Any) -> str:
+    return "\n".join(line.rstrip() for line in str(state or "").strip().splitlines())
+
+
+def _sokoban_entity_signature(state: str) -> Optional[dict[str, str]]:
+    """Extract stable coordinate-render entities while ignoring action budget text."""
+    signatures: dict[str, str] = {}
+    for raw_line in str(state or "").splitlines():
+        line = raw_line.strip()
+        for label in ("Boxes on target", "Boxes", "Player on target", "Player"):
+            prefix = f"{label}:"
+            if line.startswith(prefix):
+                signatures[label] = line[len(prefix) :].strip()
+                break
+    return signatures or None
+
+
+def classify_turn_action(
+    *,
+    action: str,
+    state_before: str,
+    state_after: str,
+    assistant_message: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return one bounded action category for label-distribution monitoring."""
+    assistant_message = assistant_message or {}
+    transition_metadata = assistant_message.get("transition_metadata", {})
+    if not isinstance(transition_metadata, dict):
+        transition_metadata = {}
+    action_metadata = transition_metadata.get("action", {})
+    if not isinstance(action_metadata, dict):
+        action_metadata = {}
+    invalid_flags = (
+        "judge_force_negative",
+        "manager_invalid_action",
+        "action_count_exceeded",
+        "trajectory_action_truncated",
+    )
+    protocol_invalid = any(
+        bool(assistant_message.get(name, transition_metadata.get(name, False)))
+        for name in invalid_flags
+    ) or any(
+        value is False
+        for value in (
+            assistant_message.get("response_format_valid", True),
+            assistant_message.get("action_format_valid", True),
+            action_metadata.get("mapping_valid", True),
+        )
+    )
+    if protocol_invalid:
+        return "invalid"
+    if not str(action).strip() or str(action).strip() == "<no action executed>":
+        return "invalid"
+
+    moved_box = transition_metadata.get(
+        "moved_box", action_metadata.get("moved_box", None)
+    )
+    moved_player = transition_metadata.get(
+        "moved_player", action_metadata.get("moved_player", None)
+    )
+    action_effective = transition_metadata.get(
+        "action_is_effective", action_metadata.get("effective", None)
+    )
+    environment_valid = transition_metadata.get(
+        "action_is_valid", action_metadata.get("environment_valid", None)
+    )
+    action_blocked = action_metadata.get("blocked", None)
+    # Machine-readable environment facts are authoritative. In particular, a
+    # mapped but blocked/ineffective move is a no-op, not a protocol violation.
+    if moved_box is True:
+        return "push"
+    if moved_player is True:
+        return "move"
+    if (
+        action_effective is False
+        or environment_valid is False
+        or action_blocked is True
+        or (moved_box is False and moved_player is False)
+    ):
+        return "no_op"
+    if not str(state_after).strip():
+        return "unknown"
+
+    before_entities = _sokoban_entity_signature(state_before)
+    after_entities = _sokoban_entity_signature(state_after)
+    if before_entities is not None and after_entities is not None:
+        before_boxes = (
+            before_entities.get("Boxes", ""),
+            before_entities.get("Boxes on target", ""),
+        )
+        after_boxes = (
+            after_entities.get("Boxes", ""),
+            after_entities.get("Boxes on target", ""),
+        )
+        if before_boxes != after_boxes:
+            return "push"
+        before_player = (
+            before_entities.get("Player", ""),
+            before_entities.get("Player on target", ""),
+        )
+        after_player = (
+            after_entities.get("Player", ""),
+            after_entities.get("Player on target", ""),
+        )
+        if before_player != after_player:
+            return "move"
+        return "no_op"
+
+    if _normalise_state_for_comparison(state_before) == _normalise_state_for_comparison(state_after):
+        return "no_op"
+    return "state_change"
+
+
+def _assistant_message_for_turn(
+    messages: Sequence[dict[str, Any]], turn_id: int
+) -> tuple[Optional[dict[str, Any]], Optional[int]]:
+    assistant_turn = 0
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        if assistant_turn == turn_id:
+            return message, message_index
+        assistant_turn += 1
+    return None, None
+
+
+def _cycle_metadata(
+    critic: FrozenGenerativeCritic,
+    messages: Sequence[dict[str, Any]],
+    assistant_message: Optional[dict[str, Any]],
+    assistant_index: Optional[int],
+    state_after: str,
+) -> tuple[bool, bool]:
+    """Return (metadata_available, is_cycle) without guessing from one transition."""
+    assistant_message = assistant_message or {}
+    transition_metadata = assistant_message.get("transition_metadata", {})
+    if not isinstance(transition_metadata, dict):
+        transition_metadata = {}
+    for key in ("is_cycle", "cycle_detected", "transition_cycle"):
+        if key in transition_metadata:
+            return True, bool(transition_metadata[key])
+        if key in assistant_message:
+            return True, bool(assistant_message[key])
+    if assistant_index is None or not state_after:
+        return False, False
+
+    earlier_states = []
+    for message in messages[:assistant_index]:
+        if message.get("role") != "user":
+            continue
+        state = critic._extract_last_state(str(message.get("content", "")))
+        if state:
+            earlier_states.append(_normalise_state_for_comparison(state))
+    # The immediately preceding state is not by itself a cycle. At least one
+    # older state is needed to identify a revisit.
+    if len(earlier_states) < 2:
+        return False, False
+    return True, _normalise_state_for_comparison(state_after) in earlier_states[:-1]
+
+
+def _batch_metadata_value(non_tensor_batch: dict[str, Any], key: str, index: int) -> Any:
+    values = non_tensor_batch.get(key)
+    if values is None:
+        return None
+    try:
+        value = values[index]
+    except (IndexError, KeyError, TypeError):
+        return None
+    return value.item() if hasattr(value, "item") else value
+
+
+def build_turn_label_observability(
+    *,
+    critic: FrozenGenerativeCritic,
+    messages_list: Sequence[Sequence[dict[str, Any]]],
+    turn_ids: torch.Tensor,
+    label_tensor: torch.Tensor,
+    raw_outputs: Sequence[str],
+    non_tensor_batch: Optional[dict[str, Any]] = None,
+    sample_weights: Optional[torch.Tensor] = None,
+    raw_output_max_chars: int = 2000,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    """Build bounded W&B metrics and audit rows from one critic result batch."""
+    non_tensor_batch = non_tensor_batch or {}
+    turn_ids_cpu = turn_ids.detach().cpu()
+    labels_cpu = label_tensor.detach().cpu()
+    if sample_weights is None:
+        row_weights = np.ones(turn_ids_cpu.shape[0], dtype=np.float64)
+    else:
+        row_weights = sample_weights.detach().cpu().float().reshape(-1).numpy().astype(np.float64)
+        if row_weights.size != turn_ids_cpu.shape[0]:
+            raise ValueError("sample_weights must match the turn-label batch size")
+
+    prompt_items = critic.build_judge_prompts(
+        messages_list=messages_list,
+        turn_ids=turn_ids_cpu,
+    )
+    outputs = list(raw_outputs)
+    if len(outputs) < len(prompt_items):
+        outputs.extend([""] * (len(prompt_items) - len(outputs)))
+    elif len(outputs) > len(prompt_items):
+        outputs = outputs[: len(prompt_items)]
+
+    action_label_weights: dict[tuple[str, int], float] = defaultdict(float)
+    action_weights: dict[str, float] = defaultdict(float)
+    label_weights: dict[int, float] = defaultdict(float)
+    cycle_available_weight = 0.0
+    cycle_weight = 0.0
+    cycle_label_weights: dict[int, float] = defaultdict(float)
+    total_weight = 0.0
+    records: list[dict[str, Any]] = []
+    is_api_backend = critic.backend in {"deepseek_api", "deepseek"}
+
+    for item, output in zip(prompt_items, outputs, strict=True):
+        sample_index = int(item.sample_index)
+        messages = messages_list[sample_index] if sample_index < len(messages_list) else []
+        assistant_message, assistant_index = _assistant_message_for_turn(messages, int(item.turn_id))
+        assistant_message = assistant_message or {}
+        transition = (
+            critic._extract_transition_context(messages, assistant_index)
+            if assistant_index is not None
+            else {
+                "state_before": "",
+                "state_after": "",
+                "observed_reward": None,
+                "has_after_state": False,
+            }
+        )
+        action = str(assistant_message.get("content", ""))
+        action_type = classify_turn_action(
+            action=action,
+            state_before=str(transition.get("state_before", "")),
+            state_after=str(transition.get("state_after", "")),
+            assistant_message=assistant_message,
+        )
+        mask = turn_ids_cpu[sample_index] == int(item.turn_id)
+        label = int(round(float(labels_cpu[sample_index][mask][0].item()))) if torch.any(mask) else 0
+        label = max(-1, min(1, label))
+        weight = max(float(row_weights[sample_index]), 0.0)
+        total_weight += weight
+        action_weights[action_type] += weight
+        action_label_weights[(action_type, label)] += weight
+        label_weights[label] += weight
+
+        cycle_available, is_cycle = _cycle_metadata(
+            critic,
+            messages,
+            assistant_message,
+            assistant_index,
+            str(transition.get("state_after", "")),
+        )
+        if cycle_available:
+            cycle_available_weight += weight
+            if is_cycle:
+                cycle_weight += weight
+                cycle_label_weights[label] += weight
+
+        if item.forced_score is not None:
+            parse_valid = True
+            judge_source = "deterministic_rule"
+        else:
+            parse_fn = critic._parse_api_score_optional if is_api_backend else critic._parse_score_optional
+            parse_valid = parse_fn(output) is not None
+            judge_source = "api" if is_api_backend else "model"
+
+        before_state = str(transition.get("state_before", ""))
+        after_state = str(transition.get("state_after", ""))
+        records.append(
+            {
+                "sample_index": sample_index,
+                "turn_id": int(item.turn_id),
+                "trajectory_turn_id": _batch_metadata_value(
+                    non_tensor_batch, "trajectory_turn_ids", sample_index
+                ),
+                "episode_id": _batch_metadata_value(non_tensor_batch, "episode_ids", sample_index),
+                "env_id": _batch_metadata_value(non_tensor_batch, "env_ids", sample_index),
+                "group_id": _batch_metadata_value(non_tensor_batch, "group_ids", sample_index),
+                "data_source": _redact_critic_audit_text(
+                    _batch_metadata_value(non_tensor_batch, "data_source", sample_index),
+                    max_chars=256,
+                ),
+                "action": _redact_critic_audit_text(action, max_chars=512),
+                "action_type": action_type,
+                "label": label,
+                "parse_valid": bool(parse_valid),
+                "judge_source": judge_source,
+                "force_reason": _redact_critic_audit_text(item.force_reason, max_chars=256),
+                "cycle_metadata_available": bool(cycle_available),
+                "is_cycle": bool(is_cycle) if cycle_available else None,
+                "observed_reward": _redact_critic_audit_text(
+                    transition.get("observed_reward", ""), max_chars=128
+                ),
+                "has_after_state": bool(transition.get("has_after_state", False)),
+                "prompt_sha256": hashlib.sha256(item.prompt.encode("utf-8")).hexdigest(),
+                "state_before_sha256": hashlib.sha256(before_state.encode("utf-8")).hexdigest(),
+                "state_after_sha256": hashlib.sha256(after_state.encode("utf-8")).hexdigest(),
+                "raw_output": _redact_critic_audit_text(output, max_chars=raw_output_max_chars),
+            }
+        )
+
+    denominator = max(total_weight, 1e-12)
+    metrics: dict[str, float] = {
+        "train/label_observability_turn_count": float(total_weight),
+        "train/label_nonzero_rate": float(
+            (label_weights[-1] + label_weights[1]) / denominator
+        ),
+        "train/cycle/metadata_available_rate": float(cycle_available_weight / denominator),
+    }
+    for action_type in _ACTION_TYPES:
+        action_weight = action_weights[action_type]
+        metrics[f"train/action_type/{action_type}_rate"] = float(action_weight / denominator)
+        for label, label_name in _LABEL_NAMES.items():
+            joint_weight = action_label_weights[(action_type, label)]
+            metrics[f"train/action_label/{action_type}_{label_name}_rate"] = float(
+                joint_weight / denominator
+            )
+            metrics[f"train/action_label/{action_type}_{label_name}_conditional_rate"] = float(
+                joint_weight / action_weight
+            ) if action_weight > 0 else 0.0
+    if cycle_available_weight > 0:
+        metrics["train/cycle/rate"] = float(cycle_weight / cycle_available_weight)
+        for label, label_name in _LABEL_NAMES.items():
+            metrics[f"train/cycle/{label_name}_rate"] = float(
+                cycle_label_weights[label] / max(cycle_weight, 1e-12)
+            )
+    return metrics, records
+
+
+class CriticAuditJsonlWriter:
+    """Secure, capped, deterministic-sampling JSONL writer for critic audits."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        sample_rate: float = 0.1,
+        max_records: int = 5000,
+    ) -> None:
+        if not 0.0 <= float(sample_rate) <= 1.0:
+            raise ValueError("critic audit sample_rate must be in [0, 1]")
+        if int(max_records) < 0:
+            raise ValueError("critic audit max_records must be non-negative")
+        if not str(path).strip():
+            raise ValueError("critic audit path must be non-empty")
+        self.path = os.path.abspath(os.path.expanduser(str(path)))
+        self.sample_rate = float(sample_rate)
+        self.max_records = int(max_records)
+        self.records_written = 0
+        self._seen_keys: set[str] = set()
+        self._file = None
+
+    def _ensure_open(self) -> None:
+        if self._file is not None:
+            return
+        parent = os.path.dirname(self.path)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.path, flags, 0o600)
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            os.close(descriptor)
+            raise ValueError(f"critic audit path is not a regular file: {self.path}")
+        os.fchmod(descriptor, 0o600)
+        self._file = os.fdopen(descriptor, "a", encoding="utf-8", buffering=1)
+
+    def _selected(self, key: str) -> bool:
+        if self.sample_rate <= 0.0:
+            return False
+        if self.sample_rate >= 1.0:
+            return True
+        sample_value = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:16], 16)
+        return sample_value / float(1 << 64) < self.sample_rate
+
+    def write(self, records: Sequence[dict[str, Any]], *, step: int) -> int:
+        if self.records_written >= self.max_records or self.max_records == 0:
+            return 0
+        selected: list[dict[str, Any]] = []
+        for record in records:
+            identity = "|".join(
+                str(record.get(name, ""))
+                for name in (
+                    "prompt_sha256",
+                    "episode_id",
+                    "trajectory_turn_id",
+                    "turn_id",
+                )
+            )
+            key = f"step={int(step)}|{identity}"
+            if key in self._seen_keys or not self._selected(key):
+                continue
+            self._seen_keys.add(key)
+            safe_record = {
+                str(name): (
+                    _redact_critic_audit_text(value, max_chars=4096)
+                    if isinstance(value, str)
+                    else value
+                )
+                for name, value in record.items()
+            }
+            selected.append({"step": int(step), **safe_record})
+            if self.records_written + len(selected) >= self.max_records:
+                break
+        if not selected:
+            return 0
+        self._ensure_open()
+        payload = "".join(
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+            for record in selected
+        )
+        self._file.write(payload)
+        self._file.flush()
+        self.records_written += len(selected)
+        return len(selected)
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 def _build_left_padded_tensors(tokenizer, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -824,6 +1277,24 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             OmegaConf.select(config, "generative_critic.train_enable", default=False)
         )
         self.generative_critic_train_tokenizer = self.tokenizer
+        self._critic_audit_writer: Optional[CriticAuditJsonlWriter] = None
+        if bool(OmegaConf.select(config, "generative_critic.audit_enable", default=False)):
+            audit_path = OmegaConf.select(config, "generative_critic.audit_path", default=None)
+            self._critic_audit_writer = CriticAuditJsonlWriter(
+                str(audit_path or ""),
+                sample_rate=float(
+                    OmegaConf.select(config, "generative_critic.audit_sample_rate", default=0.1)
+                ),
+                max_records=int(
+                    OmegaConf.select(config, "generative_critic.audit_max_records", default=5000)
+                ),
+            )
+            print(
+                "[GEN_CRITIC AUDIT] enabled "
+                f"path={self._critic_audit_writer.path} "
+                f"sample_rate={self._critic_audit_writer.sample_rate:g} "
+                f"max_records={self._critic_audit_writer.max_records}"
+            )
 
         if self.use_trainable_generative_critic:
             actor_model_path = OmegaConf.select(
@@ -863,6 +1334,8 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             )
 
     def _shutdown_frozen_critic(self) -> None:
+        if self._critic_audit_writer is not None:
+            self._critic_audit_writer.close()
         executor = self._frozen_critic_executor
         self._frozen_critic_executor = None
         if executor is not None:
@@ -1008,7 +1481,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         self,
         messages_list: list[list[dict]],
         turn_ids: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, dict, float]:
+    ) -> tuple[torch.Tensor, dict, float, list[str]]:
         """Use trainable critic worker (current parameters) to label actor actions."""
         if turn_ids is None:
             return torch.zeros(0), {
@@ -1017,15 +1490,12 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 "gen_critic/num_prompts": 0.0,
                 "gen_critic/parse_fail_rate": 1.0,
                 "gen_critic/true_rate": 0.0,
-            }, 0.0
+            }, 0.0, []
 
-        # Keep the same signed protocol as the frozen/API critic.  A missing
-        # or malformed local-critic response is a negative action score, not a
-        # neutral zero, so changing critic backends cannot change the reward
-        # semantics of turn PPO.
+        fallback_score = float(self.generative_critic.parse_fail_score)
         label_tensor = torch.where(
             turn_ids >= 0,
-            torch.full_like(turn_ids, -1, dtype=torch.float32),
+            torch.full_like(turn_ids, fallback_score, dtype=torch.float32),
             torch.zeros_like(turn_ids, dtype=torch.float32),
         )
 
@@ -1038,34 +1508,70 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                 "gen_critic/num_prompts": 0.0,
                 "gen_critic/parse_fail_rate": 0.0,
                 "gen_critic/true_rate": 0.0,
-            }, 0.0
+            }, 0.0, []
 
-        prompts = [item.prompt for item in prompt_items]
-        gen_inputs = self._build_generative_critic_prompt_batch(prompts)
-        worker_divisor = int(self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes)
-        gen_inputs, pad_size = pad_dataproto_to_divisor(gen_inputs, size_divisor=worker_divisor)
-        critic_gen_start = time.time()
-        critic_rollout = self.critic_wg.generate_critic_sequences(gen_inputs)
-        critic_gen_time = time.time() - critic_gen_start
-        critic_rollout = unpad_dataproto(critic_rollout, pad_size)
+        forced_items = [item for item in prompt_items if item.forced_score is not None]
+        request_items = [item for item in prompt_items if item.forced_score is None]
+        request_outputs: list[str] = []
+        critic_gen_time = 0.0
+        raw_model_output_count = 0
+        if request_items:
+            prompts = [item.prompt for item in request_items]
+            gen_inputs = self._build_generative_critic_prompt_batch(prompts)
+            worker_divisor = int(self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes)
+            gen_inputs, pad_size = pad_dataproto_to_divisor(gen_inputs, size_divisor=worker_divisor)
+            critic_gen_start = time.time()
+            critic_rollout = self.critic_wg.generate_critic_sequences(gen_inputs)
+            critic_gen_time = time.time() - critic_gen_start
+            critic_rollout = unpad_dataproto(critic_rollout, pad_size)
 
-        if critic_rollout.batch is not None and "responses" in critic_rollout.batch.keys():
-            outputs = self.generative_critic_train_tokenizer.batch_decode(
-                critic_rollout.batch["responses"],
-                skip_special_tokens=True,
-            )
-        elif "response_texts" in critic_rollout.non_tensor_batch:
-            outputs = critic_rollout.non_tensor_batch["response_texts"].tolist()
-        else:
-            raise RuntimeError("Trainable critic inference output has no textual responses")
+            if critic_rollout.batch is not None and "responses" in critic_rollout.batch.keys():
+                request_outputs = list(
+                    self.generative_critic_train_tokenizer.batch_decode(
+                        critic_rollout.batch["responses"],
+                        skip_special_tokens=True,
+                    )
+                )
+            elif "response_texts" in critic_rollout.non_tensor_batch:
+                response_texts = critic_rollout.non_tensor_batch["response_texts"]
+                if hasattr(response_texts, "tolist"):
+                    response_texts = response_texts.tolist()
+                request_outputs = (
+                    [response_texts]
+                    if isinstance(response_texts, str)
+                    else list(response_texts)
+                )
+            else:
+                raise RuntimeError("Trainable critic inference output has no textual responses")
+
+            raw_model_output_count = len(request_outputs)
+            if len(request_outputs) < len(request_items):
+                request_outputs.extend([""] * (len(request_items) - len(request_outputs)))
+            elif len(request_outputs) > len(request_items):
+                request_outputs = request_outputs[: len(request_items)]
+
+        request_output_by_pair = {
+            (item.sample_index, item.turn_id): output
+            for item, output in zip(request_items, request_outputs, strict=True)
+        }
+        # Match frozen-critic ordering: every constructed prompt owns one raw
+        # output slot, while deterministic forced items use an empty string.
+        outputs = [
+            ""
+            if item.forced_score is not None
+            else request_output_by_pair[(item.sample_index, item.turn_id)]
+            for item in prompt_items
+        ]
 
         parse_fail = 0
         positive_count = 0
         neutral_count = 0
         negative_count = 0
         for item, text in zip(prompt_items, outputs, strict=True):
-            parsed_score = self.generative_critic._parse_score_optional(text)
+            parsed_score = item.forced_score
             if parsed_score is None:
+                parsed_score = self.generative_critic._parse_score_optional(text)
+            if parsed_score is None and item.forced_score is None:
                 # Older trainable checkpoints emit ###label: True/False.
                 # Preserve that wire format while mapping False to the signed
                 # negative progress score required by turn PPO.
@@ -1074,7 +1580,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                     parsed_score = 1 if legacy_label else -1
             if parsed_score is None:
                 parse_fail += 1
-                parsed_score = -1
+                parsed_score = self.generative_critic.parse_fail_score
 
             value = float(self.generative_critic._normalise_score(int(parsed_score)))
             positive_count += int(value == 1.0)
@@ -1088,13 +1594,22 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             "gen_critic/enabled": 1.0,
             "gen_critic/used_trainable_critic": 1.0,
             "gen_critic/num_prompts": n,
+            "gen_critic/constructed_prompt_count": n,
+            "gen_critic/submitted_prompt_count": float(len(request_items)),
+            "gen_critic/rule_forced_negative_count": float(
+                sum(int(item.forced_score == -1) for item in forced_items)
+            ),
+            "gen_critic/model_output_count": float(raw_model_output_count),
+            "gen_critic/model_output_count_mismatch": float(
+                abs(raw_model_output_count - len(request_items))
+            ),
             "gen_critic/parse_fail_rate": float(parse_fail) / max(n, 1.0),
             "gen_critic/true_rate": float(positive_count) / max(n, 1.0),
             "gen_critic/positive_rate": float(positive_count) / max(n, 1.0),
             "gen_critic/neutral_rate": float(neutral_count) / max(n, 1.0),
             "gen_critic/negative_rate": float(negative_count) / max(n, 1.0),
         }
-        return label_tensor, metrics, critic_gen_time
+        return label_tensor, metrics, critic_gen_time, outputs
 
     def _train_generative_critic_rlvr(self, actor_batch: DataProto) -> tuple[dict, float]:
         if "messages_list" not in actor_batch.non_tensor_batch:
@@ -1895,6 +2410,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             critic_generation_time = 0.0
             label_future = None
             label_future_started = None
+            raw_judge_outputs: list[str] = []
 
             batch: DataProto = DataProto()
             is_last_step = self.global_steps >= self.total_training_steps
@@ -2104,20 +2620,28 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                         label_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
                         label_metrics = {"gen_critic/enabled": 0.0}
+                        messages_list: list[list[dict[str, Any]]] = []
                         if self.generative_critic.enabled:
-                            # The critic initializes valid actions to -1 and
-                            # replaces them only when a valid signed response is
-                            # parsed.  Thus a missing/malformed API response is
-                            # a negative turn score by construction.
+                            # Missing/malformed judgments use the configured
+                            # fallback. DeepSeek fixes this to neutral zero so an
+                            # API/format failure cannot fabricate a policy update.
                             label_tensor = torch.where(
                                 turn_ids >= 0,
-                                torch.full_like(response_mask, -1.0),
+                                torch.full_like(
+                                    response_mask,
+                                    float(self.generative_critic.parse_fail_score),
+                                ),
                                 torch.zeros_like(response_mask),
                             )
                             if "messages_list" in batch.non_tensor_batch:
                                 messages_list = batch.non_tensor_batch["messages_list"].tolist()
                                 if self.use_trainable_generative_critic and self.use_critic:
-                                    label_tensor, label_metrics, critic_label_gen_time = self._infer_labels_with_trainable_critic(
+                                    (
+                                        label_tensor,
+                                        label_metrics,
+                                        critic_label_gen_time,
+                                        raw_judge_outputs,
+                                    ) = self._infer_labels_with_trainable_critic(
                                         messages_list=messages_list,
                                         turn_ids=turn_ids,
                                     )
@@ -2125,7 +2649,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                 else:
                                     if label_future is not None:
                                         wait_started = time.perf_counter()
-                                        label_tensor, label_metrics, _ = label_future.result()
+                                        label_tensor, label_metrics, raw_judge_outputs = label_future.result()
                                         wait_time = time.perf_counter() - wait_started
                                         total_api_time = time.perf_counter() - label_future_started
                                         metrics.update(
@@ -2138,7 +2662,11 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                             }
                                         )
                                     else:
-                                        label_tensor, label_metrics, _ = self.generative_critic.infer_turn_labels(
+                                        (
+                                            label_tensor,
+                                            label_metrics,
+                                            raw_judge_outputs,
+                                        ) = self.generative_critic.infer_turn_labels(
                                             messages_list=messages_list,
                                             turn_ids=turn_ids,
                                         )
@@ -2169,6 +2697,38 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                     ),
                                 )
 
+                            if messages_list:
+                                observability_metrics, audit_records = build_turn_label_observability(
+                                    critic=self.generative_critic,
+                                    messages_list=messages_list,
+                                    turn_ids=turn_ids,
+                                    label_tensor=label_tensor,
+                                    raw_outputs=raw_judge_outputs,
+                                    non_tensor_batch=batch.non_tensor_batch,
+                                    sample_weights=batch.batch.get("sample_weights", None),
+                                    raw_output_max_chars=int(
+                                        OmegaConf.select(
+                                            self.config,
+                                            "generative_critic.audit_raw_output_max_chars",
+                                            default=2000,
+                                        )
+                                    ),
+                                )
+                                metrics.update(observability_metrics)
+                                if self._critic_audit_writer is not None:
+                                    records_written = self._critic_audit_writer.write(
+                                        audit_records,
+                                        step=self.global_steps,
+                                    )
+                                    metrics.update(
+                                        {
+                                            "train/critic_audit_records_written": float(records_written),
+                                            "train/critic_audit_records_written_total": float(
+                                                self._critic_audit_writer.records_written
+                                            ),
+                                        }
+                                    )
+
                         label_turn = collapse_turn_scores(
                             label_tensor,
                             turn_ids=turn_ids,
@@ -2196,12 +2756,42 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                             trajectory_turn_ids=batch.non_tensor_batch.get("trajectory_turn_ids", None),
                         )
 
-                        combined_turn = compose_turn_advantages(
+                        base_combined_turn = compose_turn_advantages(
                             label_turn,
                             outcome_turn,
                             mode=turn_advantage_mode,
                             label_weight=label_weight,
                             outcome_weight=outcome_weight,
+                        )
+                        turn_credit_assignment = str(
+                            self.config.algorithm.get("turn_credit_assignment", "direct")
+                        )
+                        episode_ids = batch.non_tensor_batch.get("episode_ids", None)
+                        trajectory_turn_ids = batch.non_tensor_batch.get(
+                            "trajectory_turn_ids", None
+                        )
+                        if turn_credit_assignment == "discounted_return" and (
+                            episode_ids is None or trajectory_turn_ids is None
+                        ):
+                            raise RuntimeError(
+                                "discounted_return requires exact episode_ids and trajectory_turn_ids"
+                            )
+                        combined_turn = assign_turn_credit(
+                            base_combined_turn,
+                            mode=turn_credit_assignment,
+                            turn_ids=turn_ids,
+                            response_mask=response_mask,
+                            episode_ids=(
+                                episode_ids
+                                if episode_ids is not None
+                                else np.arange(turn_ids.shape[0])
+                            ),
+                            trajectory_turn_ids=(
+                                trajectory_turn_ids
+                                if trajectory_turn_ids is not None
+                                else np.zeros(turn_ids.shape[0], dtype=int)
+                            ),
+                            gamma=float(self.config.algorithm.gamma),
                         )
 
                         # If KL is configured as a reward penalty, retain its
@@ -2329,6 +2919,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
                         turn_lengths = response_mask.sum(dim=-1).float()
                         weighted_turn_count = float(metric_weights.sum().item())
+                        optimized_advantages = batch.batch["advantages"]
                         metrics.update(label_metrics)
                         metrics.update(
                             {
@@ -2340,8 +2931,20 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                 "train/turn_length_p95": float(torch.quantile(turn_lengths, 0.95).item()),
                                 "train/label_reward_mean": weighted_turn_mean(label_turn),
                                 "train/outcome_reward_mean": weighted_turn_mean(outcome_turn),
-                                "train/combined_reward_mean": weighted_turn_mean(combined_turn),
-                                "train/combined_reward_std": weighted_turn_std(combined_turn),
+                                "train/combined_reward_mean": weighted_turn_mean(base_combined_turn),
+                                "train/combined_reward_std": weighted_turn_std(base_combined_turn),
+                                "train/credit_adjusted_advantage_mean": weighted_turn_mean(
+                                    combined_turn
+                                ),
+                                "train/credit_adjusted_advantage_std": weighted_turn_std(
+                                    combined_turn
+                                ),
+                                "train/turn_credit_direct": float(
+                                    turn_credit_assignment == "direct"
+                                ),
+                                "train/turn_credit_discounted_return": float(
+                                    turn_credit_assignment == "discounted_return"
+                                ),
                                 "train/label_only_advantage": float(turn_advantage_mode == "label_only"),
                                 "train/label_advantage_weight": (
                                     1.0 if turn_advantage_mode == "label_only" else label_weight
@@ -2360,6 +2963,18 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                                 ),
                                 "train/advantage_negative_rate": weighted_turn_mean(
                                     (combined_turn < 0).float()
+                                ),
+                                "train/advantage_nonzero_rate": weighted_turn_mean(
+                                    (optimized_advantages != 0).float()
+                                ),
+                                "train/advantage_zero_rate": weighted_turn_mean(
+                                    (optimized_advantages == 0).float()
+                                ),
+                                "train/nonzero_advantage_turn_count": float(
+                                    (
+                                        (optimized_advantages != 0).float()
+                                        * metric_weights
+                                    ).sum().item()
                                 ),
                                 "train/outcome_success_rate": float(
                                     (episode_outcomes > 0).float().mean().item()

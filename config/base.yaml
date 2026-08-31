@@ -96,6 +96,9 @@ algorithm:
   outcome_weight: 1.0
   outcome_broadcast: all_turns # all_turns (requested objective) | last_turn | none
   turn_score_reduction: mean # mean | first | last
+  # direct preserves the judge's score as the turn advantage; discounted_return
+  # interprets judge scores as transition rewards and computes episode return-to-go.
+  turn_credit_assignment: direct # direct | discounted_return
   normalize_turn_advantage: False
   allow_score_outcome_fallback: False
   add_kl_to_turn_advantage: True
@@ -124,24 +127,35 @@ generative_critic:
   deepseek_thinking: disabled # disabled keeps the short score response deterministic
   deepseek_timeout: 30.0
   # Hard deadline for the complete concurrent judge batch; unfinished turns
-  # follow the required -1 failure policy instead of stalling a PPO step.
+  # receive neutral 0 (and remain visible in API/parse failure metrics) instead
+  # of stalling a PPO step or fabricating a signed learning signal.
   deepseek_batch_timeout: 120.0
   deepseek_max_retries: 2
   deepseek_max_concurrency: 16
   deepseek_max_tokens: 32
   deepseek_raise_on_error: False
-  # Individual failures remain -1. Abort only when a whole judge batch is
-  # unhealthy, before those fallback labels can update the actor.
+  # Individual failures map to 0. Abort only when a whole judge batch is
+  # unhealthy so an outage cannot silently turn an update into all-zero work.
   deepseek_abort_on_auth_failure: True
   deepseek_max_failure_rate: 0.25
   deepseek_max_parse_fail_rate: 0.25
   deepseek_cache_enable: True
   deepseek_cache_size: 4096
   deepseek_max_prompt_chars: 12000
+  # Sampled judge outputs are written as a bounded, mode-600 JSONL audit by
+  # the experiment launcher. The generic config leaves disk logging disabled.
+  audit_enable: False
+  audit_path: null
+  audit_sample_rate: 0.1
+  audit_max_records: 5000
+  audit_raw_output_max_chars: 2000
+  # Label-only judging should compare transition state, budget and action facts.
+  # Enable only for an explicitly reward-aware ablation; terminal outcome and
+  # shaped environment reward otherwise leak into the judge target.
+  include_observed_reward: False
   response_format: structured # structured (legacy bool) | score_only (integer -1/0/1)
-  # Null keeps legacy local critics' boolean fallback; the DeepSeek launcher
-  # explicitly sets this to -1 as required by the signed API protocol.
-  parse_fail_score: null
+  # API/format failures are diagnostics, not evidence of progress or regression.
+  parse_fail_score: 0
   train_enable: False
   train_strategy: actor_ppo
   train_model_path: ${model_path}

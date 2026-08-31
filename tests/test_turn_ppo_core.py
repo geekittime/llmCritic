@@ -4,14 +4,18 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from verl import DataProto
 from verl.trainer.ppo.core_algos import compute_policy_loss
 
 from ragen.llm_agent.ctx_manager import build_legacy_turn_metadata, build_turn_token_metadata
 from ragen.trainer.agent_trainer import (
+    CriticAuditJsonlWriter,
     RayAgentTrainer,
     broadcast_outcome_to_turns,
+    build_turn_label_observability,
+    classify_turn_action,
     collapse_turn_scores,
     compose_turn_advantages,
     compute_exact_trace_observability_metrics,
@@ -20,6 +24,7 @@ from ragen.trainer.agent_trainer import (
     trajectory_outcomes,
     validate_deepseek_batch_health,
 )
+from ragen.trainer.generative_critic import FrozenGenerativeCritic, JudgePromptItem
 from ragen.trainer.core_algos import compute_turn_gae_advantage_return
 from ragen.workers.actor.dp_actor import (
     DataParallelPPOActor,
@@ -38,6 +43,271 @@ def test_score_only_validation_skips_invalid_binary_confusion_target():
     metrics = trainer._compute_critic_confusion_eval_metrics(batch=None)
 
     assert metrics == {"gen_critic/eval/confusion/skipped_no_turn_level_targets": 1.0}
+
+
+def test_turn_label_observability_records_raw_output_and_action_cross_metrics():
+    critic = FrozenGenerativeCritic(
+        OmegaConf.create(
+            {
+                "generative_critic": {
+                    "enable": True,
+                    "backend": "deepseek_api",
+                    "response_format": "score_only",
+                    "parse_fail_score": 0,
+                },
+                "custom_envs": {},
+            }
+        )
+    )
+    before = (
+        "Board size: 3 rows x 3 cols (zero-indexed).\n"
+        "Boxes: (1, 1)\nPlayer: (2, 1)"
+    )
+    after = (
+        "Board size: 3 rows x 3 cols (zero-indexed).\n"
+        "Boxes: (1, 1)\nPlayer: (2, 2)"
+    )
+    messages = [
+        {"role": "system", "content": "Solve the puzzle."},
+        {"role": "user", "content": f"Turn 1\nState:\n{before}\nYou have 5 actions left"},
+        {
+            "role": "assistant",
+            "content": "Right",
+            "transition_metadata": {
+                "state_before": before,
+                "state_after": after,
+                "is_cycle": False,
+                "action_is_valid": True,
+            },
+        },
+        {"role": "user", "content": f"Reward:\n-0.1\nState:\n{after}\nYou have 4 actions left"},
+    ]
+    turn_ids = torch.tensor([[0, 0, -1]])
+    labels = torch.tensor([[1.0, 1.0, 0.0]])
+
+    metrics, records = build_turn_label_observability(
+        critic=critic,
+        messages_list=[messages],
+        turn_ids=turn_ids,
+        label_tensor=labels,
+        raw_outputs=["FINAL_SCORE: 1"],
+        non_tensor_batch={
+            "episode_ids": np.array([7]),
+            "trajectory_turn_ids": np.array([2]),
+            "env_ids": np.array([11]),
+        },
+    )
+
+    assert metrics["train/label_nonzero_rate"] == pytest.approx(1.0)
+    assert metrics["train/action_type/move_rate"] == pytest.approx(1.0)
+    assert metrics["train/action_label/move_positive_conditional_rate"] == pytest.approx(1.0)
+    assert metrics["train/cycle/metadata_available_rate"] == pytest.approx(1.0)
+    assert records[0]["episode_id"] == 7
+    assert records[0]["trajectory_turn_id"] == 2
+    assert records[0]["action"] == "Right"
+    assert records[0]["action_type"] == "move"
+    assert records[0]["parse_valid"] is True
+    assert records[0]["raw_output"] == "FINAL_SCORE: 1"
+    assert len(records[0]["prompt_sha256"]) == 64
+
+
+def test_action_classifier_separates_push_noop_and_invalid():
+    before = "Boxes: (1, 1)\nPlayer: (2, 1)"
+    pushed = "Boxes: (0, 1)\nPlayer: (1, 1)"
+    assert classify_turn_action(
+        action="Up", state_before=before, state_after=pushed
+    ) == "push"
+    assert classify_turn_action(
+        action="Up", state_before=before, state_after=before
+    ) == "no_op"
+    assert classify_turn_action(
+        action="<no action executed>", state_before=before, state_after=before
+    ) == "invalid"
+
+
+def test_action_classifier_prefers_transition_facts_over_rendered_state():
+    same_state = "Boxes: (1, 1)\nPlayer: (2, 1)"
+    misleading_box_change = "Boxes: (0, 1)\nPlayer: (1, 1)"
+
+    assert classify_turn_action(
+        action="Up",
+        state_before=same_state,
+        state_after=same_state,
+        assistant_message={"transition_metadata": {"moved_box": True}},
+    ) == "push"
+    assert classify_turn_action(
+        action="Up",
+        state_before=same_state,
+        state_after=misleading_box_change,
+        assistant_message={
+            "transition_metadata": {
+                "moved_box": False,
+                "moved_player": False,
+                "action_is_effective": False,
+                "action_is_valid": False,
+            }
+        },
+    ) == "no_op"
+    assert classify_turn_action(
+        action="Up",
+        state_before=same_state,
+        state_after=same_state,
+        assistant_message={
+            "transition_metadata": {"action": {"mapping_valid": False}}
+        },
+    ) == "invalid"
+
+
+def test_critic_audit_writer_caps_deduplicates_and_redacts_secrets(tmp_path):
+    audit_path = tmp_path / "critic.jsonl"
+    writer = CriticAuditJsonlWriter(
+        str(audit_path), sample_rate=1.0, max_records=1
+    )
+    record = {
+        "prompt_sha256": "a" * 64,
+        "episode_id": 1,
+        "trajectory_turn_id": 0,
+        "turn_id": 0,
+        "raw_output": "accidentally echoed sk-abcdefghijklmnop",
+    }
+
+    assert writer.write([record, record], step=3) == 1
+    assert writer.write([record], step=3) == 0
+    writer.close()
+
+    payload = audit_path.read_text(encoding="utf-8")
+    assert "sk-abcdefghijklmnop" not in payload
+    assert "<redacted>" in payload
+    assert len(payload.splitlines()) == 1
+    assert audit_path.stat().st_mode & 0o077 == 0
+
+
+def _make_trainable_label_trainer(prompt_items, generated_outputs):
+    trainer = object.__new__(RayAgentTrainer)
+    trainer.generative_critic = FrozenGenerativeCritic(
+        OmegaConf.create(
+            {
+                "generative_critic": {
+                    "enable": True,
+                    "backend": "transformers",
+                    "response_format": "score_only",
+                    "parse_fail_score": 0,
+                },
+                "custom_envs": {},
+            }
+        )
+    )
+    trainer.generative_critic.build_judge_prompts = lambda **_: list(prompt_items)
+    trainer.config = OmegaConf.create(
+        {"trainer": {"n_gpus_per_node": 1, "nnodes": 1}}
+    )
+    trainer._build_generative_critic_prompt_batch = lambda prompts: list(prompts)
+
+    class FakeCriticWorker:
+        def __init__(self):
+            self.requests = []
+
+        def generate_critic_sequences(self, prompts):
+            self.requests.append(list(prompts))
+            return SimpleNamespace(
+                batch=None,
+                non_tensor_batch={
+                    "response_texts": np.asarray(generated_outputs, dtype=object)
+                },
+            )
+
+    trainer.critic_wg = FakeCriticWorker()
+    return trainer
+
+
+def test_trainable_critic_forced_items_skip_generation_and_keep_output_order(monkeypatch):
+    prompt_items = [
+        JudgePromptItem(0, 0, "forced", forced_score=-1, force_reason="invalid"),
+        JudgePromptItem(1, 0, "request-one"),
+        JudgePromptItem(2, 0, "request-two"),
+    ]
+    trainer = _make_trainable_label_trainer(
+        prompt_items,
+        generated_outputs=["FINAL_SCORE: 1"],
+    )
+    monkeypatch.setattr(
+        "ragen.trainer.agent_trainer.pad_dataproto_to_divisor",
+        lambda value, size_divisor: (value, 0),
+    )
+    monkeypatch.setattr(
+        "ragen.trainer.agent_trainer.unpad_dataproto",
+        lambda value, _: value,
+    )
+    turn_ids = torch.tensor([[0, 0], [0, 0], [0, 0]])
+
+    labels, metrics, _, raw_outputs = trainer._infer_labels_with_trainable_critic(
+        messages_list=[[], [], []],
+        turn_ids=turn_ids,
+    )
+
+    assert trainer.critic_wg.requests == [["request-one", "request-two"]]
+    assert labels[:, 0].tolist() == [-1.0, 1.0, 0.0]
+    assert raw_outputs == ["", "FINAL_SCORE: 1", ""]
+    assert metrics["gen_critic/submitted_prompt_count"] == 2.0
+    assert metrics["gen_critic/rule_forced_negative_count"] == 1.0
+    assert metrics["gen_critic/model_output_count_mismatch"] == 1.0
+    assert metrics["gen_critic/parse_fail_rate"] == pytest.approx(1.0 / 3.0)
+
+
+def test_trainable_critic_all_forced_never_builds_or_calls_model():
+    prompt_items = [
+        JudgePromptItem(0, 0, "forced-a", forced_score=-1, force_reason="invalid"),
+        JudgePromptItem(1, 0, "forced-b", forced_score=-1, force_reason="invalid"),
+    ]
+    trainer = _make_trainable_label_trainer(prompt_items, generated_outputs=[])
+    trainer._build_generative_critic_prompt_batch = lambda _: pytest.fail(
+        "all-forced batch must not build model inputs"
+    )
+    turn_ids = torch.tensor([[0], [0]])
+
+    labels, metrics, generation_time, raw_outputs = (
+        trainer._infer_labels_with_trainable_critic(
+            messages_list=[[], []],
+            turn_ids=turn_ids,
+        )
+    )
+
+    assert trainer.critic_wg.requests == []
+    assert labels[:, 0].tolist() == [-1.0, -1.0]
+    assert raw_outputs == ["", ""]
+    assert generation_time == 0.0
+    assert metrics["gen_critic/submitted_prompt_count"] == 0.0
+    assert metrics["gen_critic/rule_forced_negative_count"] == 2.0
+    assert metrics["gen_critic/parse_fail_rate"] == 0.0
+
+
+def test_trainable_critic_truncates_extra_model_outputs(monkeypatch):
+    prompt_items = [
+        JudgePromptItem(0, 0, "forced", forced_score=-1, force_reason="invalid"),
+        JudgePromptItem(1, 0, "request"),
+    ]
+    trainer = _make_trainable_label_trainer(
+        prompt_items,
+        generated_outputs=["FINAL_SCORE: -1", "FINAL_SCORE: 1", "FINAL_SCORE: 1"],
+    )
+    monkeypatch.setattr(
+        "ragen.trainer.agent_trainer.pad_dataproto_to_divisor",
+        lambda value, size_divisor: (value, 0),
+    )
+    monkeypatch.setattr(
+        "ragen.trainer.agent_trainer.unpad_dataproto",
+        lambda value, _: value,
+    )
+
+    labels, metrics, _, raw_outputs = trainer._infer_labels_with_trainable_critic(
+        messages_list=[[], []],
+        turn_ids=torch.tensor([[0], [0]]),
+    )
+
+    assert labels[:, 0].tolist() == [-1.0, -1.0]
+    assert raw_outputs == ["", "FINAL_SCORE: -1"]
+    assert metrics["gen_critic/model_output_count"] == 3.0
+    assert metrics["gen_critic/model_output_count_mismatch"] == 2.0
 
 
 def test_tracker_config_redacts_nested_credentials_without_mutating_input():

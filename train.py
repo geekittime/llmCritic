@@ -16,6 +16,7 @@ register_resolvers()
 import sys
 import socket
 import stat
+import warnings
 from omegaconf import OmegaConf
 from ragen.utils import redact_config
 
@@ -311,6 +312,43 @@ def add_dependency_and_validate_config(config):
                     "label_only is incompatible with a KL reward contribution; set "
                     "algorithm.use_kl_in_reward=False"
                 )
+        turn_credit_assignment = str(
+            config.algorithm.get("turn_credit_assignment", "direct")
+        )
+        if turn_credit_assignment not in {"direct", "discounted_return"}:
+            raise ValueError(
+                "algorithm.turn_credit_assignment must be 'direct' or "
+                f"'discounted_return', got {turn_credit_assignment!r}"
+            )
+        if turn_credit_assignment == "discounted_return":
+            if (
+                turn_advantage_mode != "label_only"
+                and float(config.algorithm.get("outcome_weight", 1.0)) != 0.0
+                and str(config.algorithm.get("outcome_broadcast", "all_turns")) == "all_turns"
+            ):
+                raise ValueError(
+                    "discounted_return cannot accumulate an outcome broadcast to all turns; "
+                    "use label_only or outcome_broadcast=last_turn/none"
+                )
+            warnings.warn(
+                "turn_credit_assignment=discounted_return treats turn scores as rewards and "
+                "uses episode return-to-go. It is not GAE: no learned value baseline is used.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            direct_score_description = (
+                "each judge label"
+                if turn_advantage_mode == "label_only"
+                else "each composed judge/outcome turn score"
+            )
+            warnings.warn(
+                f"turn_credit_assignment=direct uses {direct_score_description} directly as the policy "
+                "advantage. Neutral labels produce zero actor gradient; despite "
+                "algorithm.adv_estimator=gae, this path is not GAE and has no value baseline.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         critic_enable = config.critic.get("enable", None)
         value_critic_enabled = bool(critic_enable) or (
             critic_enable is None and config.algorithm.adv_estimator == "gae"
@@ -332,6 +370,38 @@ def add_dependency_and_validate_config(config):
 
     critic_enabled = bool(config.get("generative_critic", {}).get("enable", False))
     critic_backend = str(config.get("generative_critic", {}).get("backend", "transformers")).lower()
+    critic_config = config.get("generative_critic", {})
+    if critic_backend in {"deepseek", "deepseek_api"}:
+        parse_fail_score = critic_config.get("parse_fail_score", 0)
+        if parse_fail_score is not None and int(parse_fail_score) != 0:
+            raise ValueError(
+                "DeepSeek parse/API failures must map to neutral 0; set "
+                "generative_critic.parse_fail_score=0"
+            )
+
+    audit_enabled = bool(critic_config.get("audit_enable", False))
+    if audit_enabled:
+        audit_path = str(critic_config.get("audit_path", "") or "").strip()
+        audit_sample_rate = float(critic_config.get("audit_sample_rate", 0.1))
+        audit_max_records = int(critic_config.get("audit_max_records", 5000))
+        audit_raw_output_max_chars = int(
+            critic_config.get("audit_raw_output_max_chars", 2000)
+        )
+        if not audit_path:
+            raise ValueError("generative_critic.audit_path is required when audit_enable=True")
+        if not 0.0 <= audit_sample_rate <= 1.0:
+            raise ValueError("generative_critic.audit_sample_rate must be in [0, 1]")
+        if audit_max_records < 0:
+            raise ValueError("generative_critic.audit_max_records must be non-negative")
+        if audit_raw_output_max_chars <= 0:
+            raise ValueError(
+                "generative_critic.audit_raw_output_max_chars must be positive"
+            )
+        credential_path = critic_config.get("deepseek_api_key_file", None)
+        if credential_path and os.path.abspath(os.path.expanduser(str(credential_path))) == os.path.abspath(
+            os.path.expanduser(audit_path)
+        ):
+            raise ValueError("critic audit path must not overwrite the credential file")
     if use_turn_ppo and critic_enabled and critic_backend in {"deepseek", "deepseek_api"}:
         key_env = str(
             config.get("generative_critic", {}).get("deepseek_api_key_env", "DEEPSEEK_API_KEY")
