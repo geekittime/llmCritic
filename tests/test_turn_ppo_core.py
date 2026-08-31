@@ -51,6 +51,8 @@ def test_tracker_config_redacts_nested_credentials_without_mutating_input():
         "tokenizer_path": "/models/tokenizer",
         "max_tokens": 40,
         "ppo_max_token_len_per_gpu": 12288,
+        "deepseek_abort_on_auth_failure": True,
+        "authorization_header": "Bearer secret-for-test",
     }
 
     redacted = redact_config(config)
@@ -63,6 +65,8 @@ def test_tracker_config_redacts_nested_credentials_without_mutating_input():
     assert redacted["tokenizer_path"] == "/models/tokenizer"
     assert redacted["max_tokens"] == 40
     assert redacted["ppo_max_token_len_per_gpu"] == 12288
+    assert redacted["deepseek_abort_on_auth_failure"] is True
+    assert redacted["authorization_header"] == "<redacted>"
     assert config["generative_critic"]["deepseek_api_key"] == "sk-not-for-logs"
 
 

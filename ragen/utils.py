@@ -8,7 +8,10 @@ from collections.abc import Mapping
 
 
 _SECRET_CONFIG_KEY = re.compile(
-    r"(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|password|credential|"
+    r"(?:api[_-]?key|access[_-]?token|"
+    r"(?:^|[_-])(?:secret|password|credential)(?:$|[_-])|"
+    r"(?:^|[_-])authorization(?:$|[_-](?:env|file|header|path|value)$)|"
+    r"(?:^|[_-])auth(?:$|[_-](?:credential|env|file|header|key|path|token|value)$)|"
     r"(?:^|[_-])token(?:$|[_-](?:env|file|path|value)$))",
     re.IGNORECASE,
 )
