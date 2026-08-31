@@ -89,6 +89,108 @@ def _apply_chat_template_batch(tokenizer, texts: list[str], use_chat_template: b
     return formatted_texts
 
 
+def _episode_row_groups(
+    non_tensor_batch: dict[str, Any],
+    batch_size: int,
+) -> Optional[tuple[list[Any], dict[Any, list[int]], list[int]]]:
+    """Group turn-expanded rows and select each episode's final row."""
+    if "episode_ids" not in non_tensor_batch:
+        return None
+
+    episode_ids = np.asarray(non_tensor_batch["episode_ids"]).reshape(-1)
+    if episode_ids.size != batch_size:
+        raise ValueError(
+            f"episode_ids length {episode_ids.size} does not match batch size {batch_size}"
+        )
+
+    unique_episodes: list[Any] = []
+    episode_to_indices: dict[Any, list[int]] = {}
+    for row_index, raw_episode_id in enumerate(episode_ids):
+        episode_id = raw_episode_id.item() if hasattr(raw_episode_id, "item") else raw_episode_id
+        if episode_id not in episode_to_indices:
+            unique_episodes.append(episode_id)
+            episode_to_indices[episode_id] = []
+        episode_to_indices[episode_id].append(row_index)
+
+    turn_ids = non_tensor_batch.get("trajectory_turn_ids")
+    if turn_ids is not None:
+        turn_ids = np.asarray(turn_ids).reshape(-1)
+        if turn_ids.size != batch_size:
+            raise ValueError(
+                f"trajectory_turn_ids length {turn_ids.size} does not match batch size {batch_size}"
+            )
+
+    representative_indices = []
+    for episode_id in unique_episodes:
+        indices = episode_to_indices[episode_id]
+        if turn_ids is None:
+            representative_indices.append(indices[-1])
+        else:
+            representative_indices.append(max(indices, key=lambda index: float(turn_ids[index])))
+
+    return unique_episodes, episode_to_indices, representative_indices
+
+
+def _messages_to_log_text(messages: Sequence[dict[str, Any]]) -> str:
+    return "\n\n".join(
+        f"[{message.get('role', 'unknown')}]\n{message.get('content', '')}"
+        for message in messages
+    )
+
+
+def _messages_to_prompt_text(messages: Sequence[dict[str, Any]]) -> str:
+    prompt_messages = []
+    for message in messages:
+        if message.get("role") == "assistant":
+            break
+        prompt_messages.append(message)
+    return _messages_to_log_text(prompt_messages)
+
+
+def _validation_sample_uids(
+    validation_step: int,
+    non_tensor_batch: dict[str, Any],
+    data_sources: Sequence[Any],
+    row_indices: Sequence[int],
+) -> list[str]:
+    """Build stable task IDs without conflating identical rendered boards."""
+    if len(data_sources) != len(row_indices):
+        raise ValueError(
+            f"data source count {len(data_sources)} does not match selected row count {len(row_indices)}"
+        )
+
+    group_ids = non_tensor_batch.get("group_ids")
+    if group_ids is not None:
+        group_ids = np.asarray(group_ids).reshape(-1)
+        if row_indices and max(row_indices) >= group_ids.size:
+            raise ValueError("group_ids does not cover every selected validation row")
+
+    sample_uids = []
+    for output_index, (data_source, row_index) in enumerate(zip(data_sources, row_indices, strict=True)):
+        task_id = group_ids[row_index] if group_ids is not None else output_index
+        if hasattr(task_id, "item"):
+            task_id = task_id.item()
+        sample_uids.append(
+            f"validation_step={validation_step}|source={data_source}|group={task_id}"
+        )
+    return sample_uids
+
+
+def _aggregate_episode_scores(
+    scores: Sequence[float],
+    episode_groups: tuple[list[Any], dict[Any, list[int]], list[int]],
+    *,
+    sum_turn_scores: bool,
+) -> list[float]:
+    unique_episodes, episode_to_indices, representative_indices = episode_groups
+    if sum_turn_scores:
+        return [
+            float(sum(scores[index] for index in episode_to_indices[episode_id]))
+            for episode_id in unique_episodes
+        ]
+    return [float(scores[index]) for index in representative_indices]
+
+
 def compose_turn_advantages(
     label_turn: torch.Tensor,
     outcome_turn: torch.Tensor,
@@ -1349,6 +1451,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        sample_uids = []
 
         env_metric_dict = {}
         for step in range(self.config.trainer.validation_steps):
@@ -1383,38 +1486,27 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             output_ids = test_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
 
-            # Handle single_turn/limited_multi_turn mode: group messages by episode
-            context_window_mode = getattr(self.config.agent_proxy, "context_window_mode", "full")
-            is_turn_level_mode = context_window_mode in ("single_turn", "limited_multi_turn")
-            if is_turn_level_mode and "messages_list" in test_batch.non_tensor_batch:
-                # Group samples by episode_id to reconstruct episodes
-                episode_ids = test_batch.non_tensor_batch["episode_ids"]
+            # Exact behavior-policy rollouts are also represented by one row per
+            # turn, even when context_window_mode is "full".  Group based on
+            # the actual row metadata rather than the configured context mode.
+            episode_groups = _episode_row_groups(test_batch.non_tensor_batch, batch_size)
+            has_episode_rows = episode_groups is not None and "messages_list" in test_batch.non_tensor_batch
+            if has_episode_rows:
+                unique_groups, group_to_indices, representative_indices = episode_groups
                 messages_list = test_batch.non_tensor_batch["messages_list"]
-
-                # Find unique episodes and their samples
-                unique_groups = []
-                group_to_indices = {}
-                for i, eid in enumerate(episode_ids):
-                    if eid not in group_to_indices:
-                        unique_groups.append(eid)
-                        group_to_indices[eid] = []
-                    group_to_indices[eid].append(i)
 
                 # Create grouped outputs
                 grouped_inputs = []
                 grouped_outputs = []
                 for gid in unique_groups:
                     indices = group_to_indices[gid]
-                    # Combine all messages from this episode
-                    episode_output = ""
+                    # The first transition contains the shared initial task and
+                    # therefore groups sampled candidates from the same puzzle.
+                    grouped_inputs.append(_messages_to_prompt_text(messages_list[indices[0]]))
+                    episode_output_parts = []
                     for idx in indices:
-                        msgs = messages_list[idx]
-                        for msg in msgs:
-                            role = msg.get("role", "unknown")
-                            content = msg.get("content", "")
-                            episode_output += f"[{role}]\n{content}\n\n"
-                    grouped_inputs.append("")
-                    grouped_outputs.append(episode_output.strip())
+                        episode_output_parts.append(_messages_to_log_text(messages_list[idx]))
+                    grouped_outputs.append("\n\n".join(episode_output_parts))
 
                 sample_inputs.extend(grouped_inputs)
                 sample_outputs.extend(grouped_outputs)
@@ -1438,31 +1530,70 @@ class RayAgentTrainer(VerlRayPPOTrainer):
                         env_metric_dict[k] = []
                     env_metric_dict[k].append(v)
 
-            # Group scores by episode if turn-level mode
-            if is_turn_level_mode and "messages_list" in test_batch.non_tensor_batch:
-                grouped_scores = []
-                for gid in unique_groups:
-                    indices = group_to_indices[gid]
-                    # Use the first turn's score (all turns have same episode reward)
-                    episode_score = scores[indices[0]]
-                    grouped_scores.append(episode_score)
+            # Outcome traces put the terminal score on the final row. Exact
+            # per-turn reward traces instead need an episode sum.
+            if has_episode_rows:
+                grouped_scores = _aggregate_episode_scores(
+                    scores,
+                    episode_groups,
+                    sum_turn_scores=(
+                        "trajectory_turn_ids" in test_batch.non_tensor_batch
+                        and bool(self.config.agent_proxy.use_turn_scores)
+                    ),
+                )
                 sample_scores.extend(grouped_scores)
                 reward_extra_infos_dict["reward"].extend(grouped_scores)
             else:
                 sample_scores.extend(scores)
                 reward_extra_infos_dict["reward"].extend(scores)
+            has_trajectory_success = "trajectory_success" in test_batch.non_tensor_batch
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+                    if key == "reward" or (key == "acc" and has_trajectory_success):
+                        continue
+                    values = list(lst)
+                    if not values:
+                        continue
+                    if has_episode_rows and len(values) == batch_size:
+                        values = [values[index] for index in representative_indices]
+                    elif has_episode_rows and len(values) not in {0, len(representative_indices)}:
+                        raise ValueError(
+                            f"reward_extra_info[{key!r}] has {len(values)} rows; expected "
+                            f"0, {len(representative_indices)}, or {batch_size}"
+                        )
+                    reward_extra_infos_dict[key].extend(values)
 
             # Get data sources and group if needed
             data_sources_batch = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
-            if is_turn_level_mode and "messages_list" in test_batch.non_tensor_batch:
-                # Group data sources by episode
-                grouped_data_sources = [data_sources_batch[group_to_indices[gid][0]] for gid in unique_groups]
+            if has_episode_rows:
+                grouped_data_sources = [data_sources_batch[index] for index in representative_indices]
                 data_source_lst.append(grouped_data_sources)
+                selected_row_indices = representative_indices
             else:
                 data_source_lst.append(data_sources_batch)
+                grouped_data_sources = list(data_sources_batch)
+                selected_row_indices = list(range(batch_size))
+
+            sample_uids.extend(
+                _validation_sample_uids(
+                    step,
+                    test_batch.non_tensor_batch,
+                    grouped_data_sources,
+                    selected_row_indices,
+                )
+            )
+
+            trajectory_success = test_batch.non_tensor_batch.get("trajectory_success")
+            if trajectory_success is not None:
+                success_values = list(np.asarray(trajectory_success).reshape(-1))
+                if len(success_values) == batch_size:
+                    success_values = [success_values[index] for index in selected_row_indices]
+                elif len(success_values) != len(selected_row_indices):
+                    raise ValueError(
+                        f"trajectory_success has {len(success_values)} rows; expected "
+                        f"{len(selected_row_indices)} or {batch_size}"
+                    )
+                reward_extra_infos_dict["acc"].extend(float(value) for value in success_values)
 
         self._maybe_log_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, _type="val")
 
@@ -1472,6 +1603,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
+                gts=[None] * len(sample_scores),
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
@@ -1482,7 +1614,20 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        if len(sample_inputs) != len(sample_scores) or len(sample_outputs) != len(sample_scores):
+            raise ValueError(
+                "validation input/output/score counts differ: "
+                f"inputs={len(sample_inputs)} outputs={len(sample_outputs)} scores={len(sample_scores)}"
+            )
+        if len(data_sources) != len(sample_scores):
+            raise ValueError(
+                f"validation data source count {len(data_sources)} does not match score count {len(sample_scores)}"
+            )
+        if len(sample_uids) != len(sample_scores):
+            raise ValueError(
+                f"validation UID count {len(sample_uids)} does not match score count {len(sample_scores)}"
+            )
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = reduce_metrics(env_metric_dict)
 
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -1688,39 +1833,29 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             outputs = [""] * len(inputs)
             scores = batch.batch["rm_scores"].sum(-1).cpu().tolist()
 
-            # Group by episode if turn-level mode
-            context_window_mode = getattr(self.config.agent_proxy, "context_window_mode", "full")
-            is_turn_level_mode = context_window_mode in ("single_turn", "limited_multi_turn")
-            if is_turn_level_mode and "messages_list" in batch.non_tensor_batch:
-                episode_ids = batch.non_tensor_batch["episode_ids"]
+            episode_groups = _episode_row_groups(batch.non_tensor_batch, len(scores))
+            if episode_groups is not None and "messages_list" in batch.non_tensor_batch:
+                unique_groups, group_to_indices, representative_indices = episode_groups
                 messages_list = batch.non_tensor_batch["messages_list"]
-
-                # Find unique episodes and their samples
-                unique_groups = []
-                group_to_indices = {}
-                for i, eid in enumerate(episode_ids):
-                    if eid not in group_to_indices:
-                        unique_groups.append(eid)
-                        group_to_indices[eid] = []
-                    group_to_indices[eid].append(i)
 
                 # Create grouped outputs
                 grouped_inputs = []
                 grouped_outputs = []
-                grouped_scores = []
                 for gid in unique_groups:
                     indices = group_to_indices[gid]
-                    # Combine all messages from this episode
-                    episode_output = ""
+                    grouped_inputs.append(_messages_to_prompt_text(messages_list[indices[0]]))
+                    episode_output_parts = []
                     for idx in indices:
-                        msgs = messages_list[idx]
-                        for msg in msgs:
-                            role = msg.get("role", "unknown")
-                            content = msg.get("content", "")
-                            episode_output += f"[{role}]\n{content}\n\n"
-                    grouped_inputs.append("")
-                    grouped_outputs.append(episode_output.strip())
-                    grouped_scores.append(scores[indices[0]])
+                        episode_output_parts.append(_messages_to_log_text(messages_list[idx]))
+                    grouped_outputs.append("\n\n".join(episode_output_parts))
+                grouped_scores = _aggregate_episode_scores(
+                    scores,
+                    episode_groups,
+                    sum_turn_scores=(
+                        "trajectory_turn_ids" in batch.non_tensor_batch
+                        and bool(self.config.agent_proxy.use_turn_scores)
+                    ),
+                )
 
                 return grouped_inputs, grouped_outputs, grouped_scores
 

@@ -4,6 +4,7 @@ author: Pingyue Zhang
 date: 2025-03-30
 """
 import atexit
+import numbers
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
@@ -180,6 +181,21 @@ class EnvStateManager:
         env_outputs: List[Dict]
             {env_id: int, history: List[Dict][{state: str, actions: List[str], reward: float, info: Dict, llm_response: str, llm_raw_response: str, (Optional)images: List[PIL.Image.Image]}]}
         """
+        seen_env_ids = set()
+        for env_input in all_env_inputs:
+            raw_env_id = env_input.get('env_id')
+            if not isinstance(raw_env_id, numbers.Integral) or isinstance(raw_env_id, bool):
+                raise TypeError(f"env_id must be an integer, got {raw_env_id!r}")
+            env_id = int(raw_env_id)
+            if env_id < 0 or env_id >= len(self.envs):
+                raise IndexError(f"env_id {env_id} is outside [0, {len(self.envs)})")
+            if env_id in seen_env_ids:
+                raise ValueError(f"duplicate env_id {env_id} in one environment step batch")
+            seen_env_ids.add(env_id)
+            status = self.envs[env_id]['status']
+            if status.terminated or status.truncated:
+                raise RuntimeError(f"cannot step completed env_id {env_id}")
+
         def _execute_actions(env, actions):
             acc_reward, turn_info, turn_done = 0, {}, False
             raw_acc_reward = 0.0
@@ -202,14 +218,26 @@ class EnvStateManager:
                 pass
             return acc_reward, turn_info, turn_done, executed_actions
 
+        def _strict_success(value) -> bool:
+            if isinstance(value, (bool, np.bool_)):
+                return bool(value)
+            if isinstance(value, numbers.Real) and np.isfinite(value) and float(value) in {0.0, 1.0}:
+                return bool(value)
+            if value is not None:
+                logging.warning("Ignoring non-boolean environment success value %r", value)
+            return False
+
         def _log_env_state(status, history, cur_obs, max_actions_per_traj, executed_actions, acc_reward, turn_done, turn_info, env_input):
             obs = self._handle_mm_state(cur_obs)
             status.num_actions += len(executed_actions)
             status.rewards.append(acc_reward) # NOTE use turn-wise acc_reward
             actions_left = max_actions_per_traj - status.num_actions
             if turn_done:
-                status.terminated = True # TODO check terminated definition in gymnasium
-                status.truncated = not turn_info.get('success', False)
+                # Keep the two terminal states mutually exclusive.  Downstream
+                # code treats terminated as task success and truncated as a
+                # finished rollout that did not solve the task.
+                status.terminated = _strict_success(turn_info.get('success', False))
+                status.truncated = not status.terminated
             action_record = {
                 'actions': executed_actions, 'reward': acc_reward, 'info': turn_info,
                 'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response'],
@@ -240,6 +268,7 @@ class EnvStateManager:
 
         def _process_env_input(env_input: Dict) -> Dict:
             acc_reward, turn_info, turn_done = 0, {}, False
+            termination_reason = None
             entry = envs[env_input['env_id']]
             env_id, env = entry['env_id'], entry['env']
             actions_left_before = entry['max_actions_per_traj'] - entry['status'].num_actions
@@ -281,12 +310,15 @@ class EnvStateManager:
             })
 
             status, history = _log_env_state(entry['status'], self.rollout_cache[env_id]['history'], entry['env'].render(), entry['max_actions_per_traj'], executed_actions, acc_reward, turn_done, turn_info, env_input)
+            if turn_done:
+                termination_reason = 'environment_success' if status.terminated else 'environment_failure'
             if no_manager_action and history:
                 history[-1]['manager_invalid_action'] = True
             if status.num_actions >= entry['max_actions_per_traj'] and not turn_done:
                 status.truncated = True
-                status.terminated = True
+                status.terminated = False
                 turn_done = True
+                termination_reason = 'max_actions'
 
             return {
                 'env_id': env_id,
@@ -294,6 +326,7 @@ class EnvStateManager:
                 'history': history,
                 'turn_done': turn_done,
                 'penalty_delta': penalty_delta,
+                'termination_reason': termination_reason,
             }
 
         results: List[Optional[Dict]] = [None] * len(all_env_inputs)
@@ -322,6 +355,8 @@ class EnvStateManager:
             entry = envs[env_id]
             if result['penalty_delta']:
                 self.rollout_cache[env_id]["penalty"] += result['penalty_delta']
+            if result['termination_reason'] is not None:
+                self.rollout_cache[env_id]["termination_reason"] = result['termination_reason']
             self.rollout_cache[env_id]['history'] = result['history']
             entry['status'] = result['status']
             if not result['turn_done']:
@@ -337,9 +372,7 @@ class EnvStateManager:
             status = entry["status"]
             if status.terminated or status.truncated:
                 continue
-            # EnvStateManager historically uses terminated=True for every done
-            # episode and distinguishes failure with truncated=True.
-            status.terminated = True
+            status.terminated = False
             status.truncated = True
             cache["termination_reason"] = str(reason)
 
@@ -352,12 +385,18 @@ class EnvStateManager:
         # add metrics to rollout cache
         for entry, cache in zip(envs, rollout_cache):
             status = entry['status']
+            termination_reason = cache.get('termination_reason')
             env_metric = {
                 'success': float(status.terminated and (not status.truncated)),
                 'num_actions': status.num_actions,
+                'trajectory_done': float(status.terminated or status.truncated),
                 'trajectory_terminated': float(status.terminated),
                 'trajectory_truncated': float(status.truncated),
-                'turn_budget_exhausted': float(cache.get('termination_reason') == 'max_turn'),
+                'action_budget_exhausted': float(termination_reason == 'max_actions'),
+                'turn_budget_exhausted': float(termination_reason == 'max_turn'),
+                'rollout_budget_exhausted': float(
+                    termination_reason in {'max_actions', 'max_turn'}
+                ),
             }
 
             try:

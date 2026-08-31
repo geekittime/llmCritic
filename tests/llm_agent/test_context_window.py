@@ -103,6 +103,33 @@ def test_context_window_truncation(dummy_config):
     assert "S1" not in str(messages)
     assert "S2" in str(messages)
     assert "S3" in str(messages)
+    assert lm_inputs.non_tensor_batch["data_source"].tolist() == ["sokoban"] * 3
+
+
+def test_exact_trace_builder_rejects_empty_behavior_token_trace(dummy_config):
+    ctx = ContextManager(config=dummy_config, tokenizer=DummyTokenizer(), mode="train")
+    env_outputs = [
+        {
+            "env_id": 0,
+            "group_id": 0,
+            "tag": "sokoban",
+            "history": [
+                {
+                    "state": "S1",
+                    "llm_response": "",
+                    "llm_raw_response": "",
+                    "prompt_token_ids": [1, 2],
+                    "response_token_ids": [],
+                    "reward": 0.0,
+                    "actions_left": 10,
+                }
+            ],
+            "metrics": {"sokoban/success": 0.0},
+        }
+    ]
+
+    with pytest.raises(ValueError, match="non-empty behavior-policy token traces"):
+        ctx._build_samples_from_token_traces(env_outputs)
 
 
 def test_response_parser_flags_extra_actions_and_unparsed_suffix(dummy_config):

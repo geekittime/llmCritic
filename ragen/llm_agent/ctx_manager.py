@@ -515,6 +515,7 @@ class ContextManager:
         episode_ids: Optional[List[int]] = None,
         uid_list: Optional[List[Any]] = None,
         trajectory_success: Optional[List[float]] = None,
+        data_sources: Optional[List[str]] = None,
     ) -> DataProto:
         """Build DataProto with common structure for all modes."""
         llm_inputs = DataProto()
@@ -539,6 +540,8 @@ class ContextManager:
             non_tensor["uid"] = np.array(uid_list, dtype=object)
         if trajectory_success is not None:
             non_tensor["trajectory_success"] = np.array(trajectory_success, dtype=np.float32)
+        if data_sources is not None:
+            non_tensor["data_source"] = np.array(data_sources, dtype=object)
 
         llm_inputs.non_tensor_batch = non_tensor
         return llm_inputs
@@ -585,9 +588,12 @@ class ContextManager:
             pass
         binary_metric_suffixes = {
             "success",
+            "trajectory_done",
             "trajectory_terminated",
             "trajectory_truncated",
+            "action_budget_exhausted",
             "turn_budget_exhausted",
+            "rollout_budget_exhausted",
             "action_is_effective",
             "action_is_valid",
             "terminated",
@@ -970,6 +976,7 @@ class ContextManager:
         episode_rewards = []
         episode_success = []
         uid_list = []
+        data_sources = []
 
         max_context_window = self._resolve_max_context_window()
 
@@ -1032,6 +1039,7 @@ class ContextManager:
                 episode_rewards.append(normalized_reward)
                 episode_success.append(float(env_output.get("metrics", {}).get(f"{env_output['tag']}/success", 0.0)))
                 uid_list.append(env_output.get("uid", env_output["env_id"]))
+                data_sources.append(env_output["tag"])
 
         # Tokenize
         input_ids, attention_mask, position_ids = self._tokenize_and_build_tensors(llm_input_texts)
@@ -1051,7 +1059,8 @@ class ContextManager:
         # Build DataProto
         llm_inputs = self._build_dataproto(
             input_ids, attention_mask, position_ids, loss_mask, score_tensor,
-            env_ids, group_ids, messages_list, episode_ids, uid_list, episode_success
+            env_ids, group_ids, messages_list, episode_ids, uid_list, episode_success,
+            data_sources=data_sources,
         )
 
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
@@ -1073,6 +1082,7 @@ class ContextManager:
         episode_rewards = []
         episode_success = []
         uid_list = []
+        data_sources = []
 
         max_context_window = self._resolve_max_context_window()
 
@@ -1135,6 +1145,7 @@ class ContextManager:
                 episode_rewards.append(normalized_reward)
                 episode_success.append(float(env_output.get("metrics", {}).get(f"{env_output['tag']}/success", 0.0)))
                 uid_list.append(env_output.get("uid", env_output["env_id"]))
+                data_sources.append(env_output["tag"])
 
         # Tokenize
         input_ids, attention_mask, position_ids = self._tokenize_and_build_tensors(llm_input_texts)
@@ -1154,7 +1165,8 @@ class ContextManager:
         # Build DataProto
         llm_inputs = self._build_dataproto(
             input_ids, attention_mask, position_ids, loss_mask, score_tensor,
-            env_ids, group_ids, messages_list, episode_ids, uid_list, episode_success
+            env_ids, group_ids, messages_list, episode_ids, uid_list, episode_success,
+            data_sources=data_sources,
         )
 
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
@@ -1208,12 +1220,11 @@ class ContextManager:
                 prompt_ids = list(turn["prompt_token_ids"])
                 response_ids = list(turn["response_token_ids"])
                 if not prompt_ids or not response_ids:
-                    logging.warning(
-                        "Skipping empty token trace for env=%s turn=%s",
-                        env_output.get("env_id"),
-                        turn_index,
+                    raise ValueError(
+                        "Exact turn PPO requires non-empty behavior-policy token traces; "
+                        f"env={env_output.get('env_id')} turn={turn_index} has "
+                        f"prompt_tokens={len(prompt_ids)} response_tokens={len(response_ids)}"
                     )
-                    continue
 
                 token_sequences.append(prompt_ids + response_ids)
                 prompt_lengths.append(len(prompt_ids))
@@ -1327,6 +1338,10 @@ class ContextManager:
             "episode_ids": np.asarray(episode_ids, dtype=int),
             "trajectory_turn_ids": np.asarray(trajectory_turn_ids, dtype=int),
             "trajectory_success": np.asarray(trajectory_success, dtype=np.float32),
+            "data_source": np.asarray(
+                [env_outputs[episode_id]["tag"] for episode_id in episode_ids],
+                dtype=object,
+            ),
         }
         response_length = float(np.mean(response_lengths))
         llm_inputs.meta_info = {"metrics": self._compute_metrics(env_outputs, response_length)}
@@ -1468,6 +1483,10 @@ class ContextManager:
             "env_ids": np.array([env_output["env_id"] for env_output in env_outputs], dtype=int),
             "group_ids": np.array([env_output["group_id"] for env_output in env_outputs], dtype=int),
             "messages_list": np.array(messages_list, dtype=object),
+            "data_source": np.array(
+                [env_output["tag"] for env_output in env_outputs],
+                dtype=object,
+            ),
             "trajectory_success": np.array([
                 float(env_output.get("metrics", {}).get(f"{env_output.get('tag', '')}/success", 0.0))
                 for env_output in env_outputs
