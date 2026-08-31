@@ -12,6 +12,7 @@ import concurrent.futures
 import inspect
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -49,10 +50,10 @@ def _config(**critic_overrides):
         ("```text\nFINAL_SCORE: 0\n```", 0),
         ("```\nFINAL_SCORE: -1\n```", -1),
         ("<answer>0</answer>", 0),
-        ("The coordinates include 1 and 0.\nNo final score.", -1),
-        ("FINAL_SCORE: 2", -1),
+        ("The coordinates include 1 and 0.\nNo final score.", 0),
+        ("FINAL_SCORE: 2", 0),
         ("###label: False", -1),
-        ("", -1),
+        ("", 0),
     ],
 )
 def test_parse_score_requires_explicit_final_line(text, expected):
@@ -75,7 +76,8 @@ def test_score_prompt_contains_transition_and_machine_contract():
     assert "before-state" in prompt
     assert "Right" in prompt
     assert "after-state" in prompt
-    assert "-0.1" in prompt
+    assert "-0.1" not in prompt
+    assert "Observed immediate reward" not in prompt
     assert "FINAL_SCORE: 1" in prompt
     assert "FINAL_SCORE: 0" in prompt
     assert "FINAL_SCORE: -1" in prompt
@@ -86,6 +88,24 @@ def test_score_prompt_contains_transition_and_machine_contract():
     system_message = critic._build_deepseek_messages(prompt)[0]["content"]
     assert "Return exactly one line" in system_message
     assert "rationale" not in system_message.lower()
+
+
+def test_observed_reward_is_available_only_for_explicit_reward_aware_ablation():
+    critic = FrozenGenerativeCritic(_config(include_observed_reward=True))
+    prompt = critic._build_single_prompt(
+        state_before="before-state",
+        action_text="Right",
+        state_after="after-state",
+        observed_reward="-0.1",
+        turn_number=3,
+        has_after_state=True,
+        env_instruction="Solve the puzzle",
+        critic_instruction=None,
+        response_format="score_only",
+        include_observed_reward=critic.include_observed_reward,
+    )
+    assert "[Observed immediate reward]" in prompt
+    assert "-0.1" in prompt
 
 
 def test_score_protocol_prefers_task_specific_integer_rubric():
@@ -100,6 +120,16 @@ def test_score_protocol_prefers_task_specific_integer_rubric():
     critic = FrozenGenerativeCritic(config)
     instruction = critic._get_task_specific_critic_instruction("Solve this puzzle. Carefully.")
     assert instruction == "Neutral actions receive integer score 0."
+
+
+def test_coord_sokoban_rubric_has_strict_precedence_and_no_uncertainty_zero():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "envs.yaml"
+    rubric = str(OmegaConf.load(config_path).custom_envs.CoordSokoban.score_critic_instruction)
+    assert "first matching rule wins" in rubric
+    assert "equal/worse repeated state" in rubric
+    assert "strictly better state is a +1 recovery" in rubric
+    assert "shortest useful route" in rubric
+    assert "Zero is an equality label, never an uncertainty label" in rubric
 
 
 @pytest.mark.parametrize(
@@ -119,6 +149,11 @@ def test_api_backend_forces_integer_protocol_when_base_config_is_legacy():
     config = _config(response_format="structured")
     critic = FrozenGenerativeCritic(config)
     assert critic.response_format == "score_only"
+
+
+def test_api_backend_forces_neutral_parse_failure_despite_stale_override():
+    critic = FrozenGenerativeCritic(_config(parse_fail_score=-1))
+    assert critic.parse_fail_score == 0
 
 
 def test_deepseek_request_disables_thinking_by_default():
@@ -355,7 +390,7 @@ def test_malformed_api_output_is_not_cached():
     assert len(fake.chat.completions.calls) == 2
 
 
-def test_auth_failure_does_not_retry_and_maps_to_negative():
+def test_auth_failure_does_not_retry_and_preserves_empty_output():
     class _AuthError(Exception):
         status_code = 401
 
@@ -366,6 +401,26 @@ def test_auth_failure_does_not_retry_and_maps_to_negative():
     assert outputs == ["", ""]
     assert len(fake.chat.completions.calls) == 2
     assert critic._last_generation_metadata["gen_critic/api_auth_failure_count"] == 2.0
+
+
+def test_api_transport_failure_maps_to_neutral_label_and_failure_metrics():
+    class _AuthError(Exception):
+        status_code = 401
+
+    critic = FrozenGenerativeCritic(_config(deepseek_max_retries=5))
+    critic._deepseek_client = _FakeClient(lambda kwargs: _AuthError())
+    scores, metrics, outputs = critic.infer_turn_labels(
+        [_messages("ACTION")],
+        torch.zeros((1, 2), dtype=torch.long),
+    )
+
+    assert outputs == [""]
+    assert scores.tolist() == [[0.0, 0.0]]
+    assert metrics["gen_critic/parse_fail_rate"] == 1.0
+    assert metrics["gen_critic/neutral_rate"] == 1.0
+    assert metrics["gen_critic/negative_rate"] == 0.0
+    assert metrics["gen_critic/score_mean"] == 0.0
+    assert metrics["gen_critic/api_auth_failure_count"] == 1.0
 
 
 def test_strict_api_mode_raises_sanitized_batch_error():
@@ -482,7 +537,114 @@ def _messages(action: str, **assistant_metadata):
     ]
 
 
-def test_infer_turn_labels_uses_signed_scores_and_api_failure_is_negative():
+def test_transition_metadata_overrides_legacy_text_and_exposes_decision_facts():
+    critic = FrozenGenerativeCritic(_config())
+    messages = [
+        {"role": "system", "content": "Solve the Sokoban task under the stated movement rules."},
+        {
+            "role": "user",
+            "content": "Turn 4\nState:\nlegacy-before\nYou have 6 actions left.",
+        },
+        {
+            "role": "assistant",
+            "content": "Left",
+            "transition_metadata": {
+                "state_before": "metadata-before",
+                "state_after": "metadata-after",
+                "actions_left_before": 6,
+                "actions_left_after": 5,
+                "turns_left": 5,
+                "success": False,
+                "terminated": False,
+                "truncated": False,
+                "termination_reason": "in_progress",
+                "action_is_effective": True,
+                "action_is_valid": True,
+                "moved_player": True,
+                "moved_box": False,
+                "previous_action": "Right",
+                "is_inverse": True,
+                "state_seen_count": 2,
+                "is_cycle": True,
+                "shortest_solution_length_before": 8,
+                "shortest_solution_length_after": 7,
+                "deadlock_before": False,
+                "deadlock_after": False,
+                "environment_info": {
+                    "solver_status_before": "solvable",
+                    "solver_status_after": "solvable",
+                },
+                "observed_reward": 99,
+            },
+        },
+        {
+            "role": "user",
+            "content": "Reward:\n-0.1\nTurn 5\nState:\nlegacy-after\nYou have 5 actions left.",
+        },
+    ]
+
+    item = critic.build_judge_prompts([messages], torch.tensor([[0]]))[0]
+    prompt = item.prompt
+
+    assert "metadata-before" in prompt
+    assert "metadata-after" in prompt
+    assert "legacy-before" not in prompt
+    assert "legacy-after" not in prompt
+    assert "actions_left_before: 6" in prompt
+    assert "actions_left_after: 5" in prompt
+    assert "success: false" in prompt
+    assert "previous_action: Right" in prompt
+    assert "is_inverse: true" in prompt
+    assert "state_seen_count: 2" in prompt
+    assert "is_cycle: true" in prompt
+    assert "shortest_solution_length_before: 8" in prompt
+    assert "shortest_solution_length_after: 7" in prompt
+    assert "solution_effort_delta: -1.0" in prompt
+    assert "solver_progress_relation: closer" in prompt
+    assert "solver_status_after: solvable" in prompt
+    assert "99" not in prompt
+    assert "-0.1" not in prompt
+    assert "Never use 0 to express uncertainty" in prompt
+
+
+def test_exact_solver_regression_is_rendered_as_authoritative_farther_relation():
+    critic = FrozenGenerativeCritic(_config())
+    messages = _messages(
+        "Right",
+        transition_metadata={
+            "state_before": "before",
+            "state_after": "after",
+            "shortest_solution_length_before": 3,
+            "shortest_solution_length_after": 4,
+            "action_is_valid": True,
+            "action_is_effective": True,
+        },
+    )
+
+    prompt = critic.build_judge_prompts([messages], torch.tensor([[0]]))[0].prompt
+    assert "solution_effort_delta: 1.0" in prompt
+    assert "solver_progress_relation: farther" in prompt
+    assert "solver_progress_relation=farther requires FINAL_SCORE: -1" in prompt
+
+
+def test_legacy_transition_text_still_recovers_action_budget():
+    critic = FrozenGenerativeCritic(_config())
+    messages = [
+        {"role": "system", "content": "Solve."},
+        {"role": "user", "content": "Turn 0\nState:\ns0\nYou have 3 actions left."},
+        {"role": "assistant", "content": "Right"},
+        {
+            "role": "user",
+            "content": "Reward:\n-0.1\nTurn 1\nState:\ns1\nYou have 2 actions left.",
+        },
+    ]
+    prompt = critic.build_judge_prompts([messages], torch.tensor([[0]]))[0].prompt
+    assert "actions_left_before: 3" in prompt
+    assert "actions_left_after: 2" in prompt
+    assert "[Observed immediate reward]" not in prompt
+
+
+def test_infer_turn_labels_uses_signed_scores_and_api_failure_is_neutral():
     def responder(kwargs):
         prompt = kwargs["messages"][1]["content"]
         if "ACTION_POS" in prompt:
@@ -500,9 +662,13 @@ def test_infer_turn_labels_uses_signed_scores_and_api_failure_is_negative():
 
     scores, metrics, outputs = critic.infer_turn_labels(messages, turn_ids)
 
-    assert scores[:, 0].tolist() == [1.0, 0.0, -1.0]
-    assert scores[:, 1].tolist() == [1.0, 0.0, -1.0]
+    assert scores[:, 0].tolist() == [1.0, 0.0, 0.0]
+    assert scores[:, 1].tolist() == [1.0, 0.0, 0.0]
     assert metrics["gen_critic/parse_fail_rate"] == pytest.approx(1 / 3)
+    assert metrics["gen_critic/positive_rate"] == pytest.approx(1 / 3)
+    assert metrics["gen_critic/neutral_rate"] == pytest.approx(2 / 3)
+    assert metrics["gen_critic/negative_rate"] == 0.0
+    assert metrics["gen_critic/score_mean"] == pytest.approx(1 / 3)
     assert len(outputs) == 3
 
 
@@ -531,14 +697,14 @@ def test_api_inference_rejects_and_does_not_cache_noncontract_output(malformed_o
         turn_ids,
     )
 
-    assert first_scores.tolist() == [[-1.0, -1.0]]
-    assert second_scores.tolist() == [[-1.0, -1.0]]
+    assert first_scores.tolist() == [[0.0, 0.0]]
+    assert second_scores.tolist() == [[0.0, 0.0]]
     assert first_metrics["gen_critic/parse_fail_rate"] == 1.0
     assert second_metrics["gen_critic/parse_fail_rate"] == 1.0
     assert len(fake.chat.completions.calls) == 2
 
 
-def test_missing_judge_prompt_is_reported_and_rejected_before_update():
+def test_missing_judge_prompt_is_reported_and_maps_to_neutral():
     critic = FrozenGenerativeCritic(_config())
     critic._deepseek_client = _FakeClient(lambda kwargs: "FINAL_SCORE: -1")
     turn_ids = torch.zeros((2, 2), dtype=torch.long)
@@ -548,11 +714,14 @@ def test_missing_judge_prompt_is_reported_and_rejected_before_update():
         turn_ids,
     )
 
-    assert scores.tolist() == [[-1.0, -1.0], [-1.0, -1.0]]
+    assert scores.tolist() == [[-1.0, -1.0], [0.0, 0.0]]
     assert len(outputs) == 1
     assert metrics["gen_critic/missing_prompt_count"] == 1.0
     assert metrics["gen_critic/prompt_coverage_rate"] == 0.5
     assert metrics["gen_critic/parse_fail_rate"] == 0.5
+    assert metrics["gen_critic/negative_rate"] == 0.5
+    assert metrics["gen_critic/neutral_rate"] == 0.5
+    assert metrics["gen_critic/score_mean"] == -0.5
     with pytest.raises(RuntimeError, match="prompt coverage"):
         validate_deepseek_batch_health(metrics)
 

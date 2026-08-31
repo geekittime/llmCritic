@@ -4,6 +4,7 @@ author: Pingyue Zhang
 date: 2025-03-30
 """
 import atexit
+import hashlib
 import numbers
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -17,6 +18,64 @@ import logging
 from ragen.env import REGISTERED_ENVS, REGISTERED_ENV_CONFIGS
 from ragen.utils import register_resolvers
 register_resolvers()
+
+
+def _metadata_safe(value):
+    """Convert common environment values to JSON-compatible metadata."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _metadata_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_metadata_safe(item) for item in value]
+    return str(value)
+
+
+def _state_fingerprint(entry: Dict[str, Any]) -> str:
+    """Build a stable state identifier for repeats and short cycles."""
+    digest = hashlib.sha256()
+    digest.update(str(entry.get("state", "")).encode("utf-8", errors="replace"))
+    for image in entry.get("images", []):
+        array = np.asarray(image)
+        digest.update(str((array.shape, array.dtype)).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _actions_are_inverse(previous_actions: List[str], current_actions: List[str]) -> bool:
+    if len(previous_actions) != 1 or len(current_actions) != 1:
+        return False
+    opposites = {"up": "down", "down": "up", "left": "right", "right": "left"}
+    previous = str(previous_actions[0]).strip().lower()
+    current = str(current_actions[0]).strip().lower()
+    return opposites.get(previous) == current
+
+
+def _finalize_latest_transition(history, status, done: bool, reason: Optional[str]) -> None:
+    """Attach the manager's final termination decision to the latest action."""
+    for turn in reversed(history):
+        metadata = turn.get('transition_metadata')
+        if metadata is None:
+            continue
+        termination = metadata.setdefault('termination', {})
+        termination.update({
+            'done': bool(done),
+            'terminated': bool(status.terminated),
+            'truncated': bool(status.truncated),
+            'success': bool(status.terminated and not status.truncated),
+            'reason': str(reason) if reason is not None else None,
+        })
+        metadata.update({
+            'success': bool(status.terminated and not status.truncated),
+            'terminated': bool(status.terminated),
+            'truncated': bool(status.truncated),
+            'termination_reason': str(reason) if reason is not None else None,
+        })
+        return
 
 @dataclass
 class EnvStatus:
@@ -200,18 +259,59 @@ class EnvStateManager:
             acc_reward, turn_info, turn_done = 0, {}, False
             raw_acc_reward = 0.0
             executed_actions = []
+            primitive_infos = []
             for action in actions:
                 _, reward, done, info = env.step(action)
                 acc_reward += reward
+                info = dict(info or {})
                 try:
                     raw_acc_reward += float(info.get('raw_reward', 0.0))
                 except Exception:
                     pass
-                turn_info.update(info) # NOTE: currently use last info for multi-action
+                primitive_infos.append(info)
+                # Unknown environment-specific values retain the established
+                # last-primitive behavior. Transition facts below are reduced
+                # explicitly so they describe the complete macro action.
+                turn_info.update(info)
                 executed_actions.append(action)
                 if done:
                     turn_done = True
                     break
+
+            if primitive_infos:
+                first_info = primitive_infos[0]
+                last_info = primitive_infos[-1]
+                for key in (
+                    'shortest_solution_length_before',
+                    'deadlock_before',
+                    'solver_status_before',
+                    'action_player_position_before',
+                ):
+                    if key in first_info:
+                        turn_info[key] = first_info[key]
+                for key in (
+                    'shortest_solution_length_after',
+                    'deadlock_after',
+                    'solver_status_after',
+                    'action_player_position_after',
+                ):
+                    if key in last_info:
+                        turn_info[key] = last_info[key]
+                for key in (
+                    'action_is_effective',
+                    'action_is_blocked',
+                    'action.moved_player',
+                    'action.moved_box',
+                ):
+                    values = [item[key] for item in primitive_infos if key in item]
+                    if len(values) == len(primitive_infos):
+                        turn_info[key] = any(bool(value) for value in values)
+                for key in ('action_is_valid', 'action_is_mapped'):
+                    values = [item[key] for item in primitive_infos if key in item]
+                    if len(values) == len(primitive_infos):
+                        turn_info[key] = all(bool(value) for value in values)
+                if all('action_is_effective' in item for item in primitive_infos):
+                    turn_info['action_is_noop'] = not bool(turn_info['action_is_effective'])
             try:
                 turn_info['raw_reward'] = float(raw_acc_reward)
             except Exception:
@@ -229,6 +329,17 @@ class EnvStateManager:
 
         def _log_env_state(status, history, cur_obs, max_actions_per_traj, executed_actions, acc_reward, turn_done, turn_info, env_input):
             obs = self._handle_mm_state(cur_obs)
+            before_entry = history[-1]
+            actions_left_before = int(before_entry.get('actions_left', max_actions_per_traj - status.num_actions))
+            num_actions_before = int(status.num_actions)
+            turn_index = sum(1 for item in history if 'llm_response' in item)
+
+            previous_action_texts = []
+            for prior_turn in reversed(history):
+                if 'llm_response' in prior_turn:
+                    previous_action_texts = list(prior_turn.get('executed_action_texts', []))
+                    break
+
             status.num_actions += len(executed_actions)
             status.rewards.append(acc_reward) # NOTE use turn-wise acc_reward
             actions_left = max_actions_per_traj - status.num_actions
@@ -238,6 +349,123 @@ class EnvStateManager:
                 # finished rollout that did not solve the task.
                 status.terminated = _strict_success(turn_info.get('success', False))
                 status.truncated = not status.terminated
+            after_entry = {'state': obs} if isinstance(obs, str) else {
+                'state': "<images>" * len(obs),
+                'images': obs,
+            }
+            after_entry['actions_left'] = actions_left
+            before_fingerprint = _state_fingerprint(before_entry)
+            after_fingerprint = _state_fingerprint(after_entry)
+            prior_state_fingerprints = [_state_fingerprint(item) for item in history]
+            before_seen_count = prior_state_fingerprints.count(before_fingerprint)
+            after_seen_count_before = prior_state_fingerprints.count(after_fingerprint)
+            previous_matching_index = next(
+                (
+                    index
+                    for index in range(len(prior_state_fingerprints) - 1, -1, -1)
+                    if prior_state_fingerprints[index] == after_fingerprint
+                ),
+                None,
+            )
+            current_action_texts = list(env_input.get('executed_action_texts', []))
+            max_turns = getattr(getattr(self.sys_config, 'agent_proxy', None), 'max_turn', None)
+            turns_left = (
+                max(int(max_turns) - (turn_index + 1), 0)
+                if max_turns is not None
+                else None
+            )
+            environment_valid = _metadata_safe(turn_info.get('action_is_valid'))
+            action_effective = _metadata_safe(turn_info.get('action_is_effective'))
+            moved_player = _metadata_safe(turn_info.get('action.moved_player'))
+            moved_box = _metadata_safe(turn_info.get('action.moved_box'))
+            is_inverse = _actions_are_inverse(previous_action_texts, current_action_texts)
+            is_cycle = after_seen_count_before > 0
+            transition_metadata = {
+                'schema_version': 1,
+                'environment_tag': str(env_input.get('environment_tag', '')),
+                'turn_index': turn_index,
+                'turn_number': turn_index + 1,
+                'turns_left': turns_left,
+                'state_before': before_entry.get('state', ''),
+                'state_after': after_entry.get('state', ''),
+                'actions_left_before': actions_left_before,
+                'actions_left_after': int(actions_left),
+                'success': bool(status.terminated and not status.truncated),
+                'terminated': bool(status.terminated),
+                'truncated': bool(status.truncated),
+                'termination_reason': None,
+                'action_is_effective': action_effective,
+                'action_is_valid': environment_valid,
+                'moved_player': moved_player,
+                'moved_box': moved_box,
+                'previous_action': (
+                    previous_action_texts[0]
+                    if len(previous_action_texts) == 1
+                    else list(previous_action_texts)
+                ),
+                'is_inverse': is_inverse,
+                'state_seen_count': after_seen_count_before,
+                'is_cycle': is_cycle,
+                'shortest_solution_length_before': _metadata_safe(
+                    turn_info.get('shortest_solution_length_before')
+                ),
+                'shortest_solution_length_after': _metadata_safe(
+                    turn_info.get('shortest_solution_length_after')
+                ),
+                'deadlock_before': _metadata_safe(turn_info.get('deadlock_before')),
+                'deadlock_after': _metadata_safe(turn_info.get('deadlock_after')),
+                'before': {
+                    'state': before_entry.get('state', ''),
+                    'state_fingerprint': before_fingerprint,
+                    'actions_left': actions_left_before,
+                    'primitive_actions_used': num_actions_before,
+                    'state_seen_count': before_seen_count,
+                },
+                'after': {
+                    'state': after_entry.get('state', ''),
+                    'state_fingerprint': after_fingerprint,
+                    'actions_left': int(actions_left),
+                    'primitive_actions_used': int(status.num_actions),
+                    'state_seen_count_before_transition': after_seen_count_before,
+                    'state_seen_count': after_seen_count_before + 1,
+                },
+                'action': {
+                    'requested_texts': list(env_input.get('actions', [])),
+                    'mapped_action_count': int(env_input.get('mapped_action_count', len(executed_actions))),
+                    'executed_ids': _metadata_safe(executed_actions),
+                    'executed_texts': current_action_texts,
+                    'previous_executed_texts': previous_action_texts,
+                    'mapping_valid': not bool(env_input.get('manager_invalid_action', False)),
+                    'environment_valid': environment_valid,
+                    'effective': action_effective,
+                    'blocked': _metadata_safe(turn_info.get('action_is_blocked')),
+                    'moved_player': moved_player,
+                    'moved_box': moved_box,
+                    'repeats_previous_action': bool(
+                        previous_action_texts and previous_action_texts == current_action_texts
+                    ),
+                    'is_inverse_of_previous_action': is_inverse,
+                },
+                'history': {
+                    'is_noop': before_fingerprint == after_fingerprint,
+                    'is_cycle': is_cycle,
+                    'cycle_length': (
+                        len(history) - previous_matching_index
+                        if previous_matching_index is not None
+                        else None
+                    ),
+                },
+                'observed_reward': float(acc_reward),
+                'environment_info': _metadata_safe(turn_info),
+                'termination': {
+                    'environment_done': bool(turn_done),
+                    'done': bool(turn_done),
+                    'terminated': bool(status.terminated),
+                    'truncated': bool(status.truncated),
+                    'success': bool(status.terminated and not status.truncated),
+                    'reason': None,
+                },
+            }
             action_record = {
                 'actions': executed_actions, 'reward': acc_reward, 'info': turn_info,
                 'llm_response': env_input['llm_response'], 'llm_raw_response': env_input['llm_raw_response'],
@@ -249,6 +477,7 @@ class EnvStateManager:
                 'trajectory_action_truncated': bool(env_input.get('trajectory_action_truncated', False)),
                 'judge_force_negative': bool(env_input.get('judge_force_negative', False)),
                 'judge_force_reason': str(env_input.get('judge_force_reason', '')),
+                'transition_metadata': transition_metadata,
             }
             for trace_key in ("prompt_token_ids", "response_token_ids"):
                 if trace_key in env_input:
@@ -302,6 +531,8 @@ class EnvStateManager:
                 violation_reasons.append('trajectory_action_budget_exceeded')
             env_input = dict(env_input)
             env_input.update({
+                'environment_tag': entry['tag'],
+                'mapped_action_count': len(valid_actions),
                 'executed_action_texts': executed_action_texts,
                 'manager_invalid_action': manager_invalid_action,
                 'trajectory_action_truncated': trajectory_action_truncated,
@@ -319,6 +550,7 @@ class EnvStateManager:
                 status.terminated = False
                 turn_done = True
                 termination_reason = 'max_actions'
+            _finalize_latest_transition(history, status, turn_done, termination_reason)
 
             return {
                 'env_id': env_id,
@@ -375,6 +607,7 @@ class EnvStateManager:
             status.terminated = False
             status.truncated = True
             cache["termination_reason"] = str(reason)
+            _finalize_latest_transition(cache.get("history", []), status, True, str(reason))
 
     def get_rollout_states(self):
         """Get the final output for all environment"""

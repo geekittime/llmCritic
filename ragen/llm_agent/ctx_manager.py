@@ -5,6 +5,8 @@ date: 2025-03-30
 """
 from itertools import zip_longest
 import logging
+from collections.abc import Mapping
+from copy import deepcopy
 
 import torch
 import numpy as np
@@ -21,6 +23,19 @@ from tensordict import TensorDict
 
 from dataclasses import asdict
 register_resolvers()
+
+
+def _deep_merge_dict(base: Dict[str, Any], overrides: Optional[Mapping]) -> Dict[str, Any]:
+    """Return a recursive copy of ``base`` updated by an OmegaConf mapping."""
+    result = deepcopy(base)
+    if overrides is None:
+        return result
+    for key, value in overrides.items():
+        if isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
+            result[key] = _deep_merge_dict(dict(result[key]), value)
+        else:
+            result[key] = deepcopy(value)
+    return result
 
 def get_special_tokens(tokenizer: AutoTokenizer):
     if "qwen" in tokenizer.name_or_path.lower():
@@ -253,14 +268,20 @@ class ContextManager:
 
             self._check_env_installed(env_config.env_type)
             env_config_new = asdict(REGISTERED_ENV_CONFIGS[env_config.env_type]())
-            for k,v in env_config.items():
-                env_config_new[k] = v
+            # Runtime environment parameters live under ``env_config`` while
+            # prompt-only settings (instruction, token limit, etc.) live one
+            # level above it. Merge both without retaining the wrapper key.
+            env_config_new = _deep_merge_dict(env_config_new, env_config.get("env_config"))
+            env_config_new = _deep_merge_dict(
+                env_config_new,
+                {key: value for key, value in env_config.items() if key != "env_config"},
+            )
             env_instruction = env_config_new.get("env_instruction", "")
             observation_format = env_config_new.get("observation_format", "grid")
-            if observation_format == "grid" and env_config_new.get("grid_vocab", False):
+            if observation_format in {"grid", "grid_coord"} and env_config_new.get("grid_vocab", False):
                 grid_vocab_str = "\nThe meaning of each symbol in the state is:\n" + ", ".join([f"{k}: {v}" for k, v in env_config_new["grid_vocab"].items()])
                 env_instruction += grid_vocab_str
-            if observation_format == "coord":
+            if observation_format in {"coord", "grid_coord"}:
                 coord_hint = (
                     "\nStates are provided as coordinate lists using zero-based indexing "
                     "with the format (row, col) for each entity type: Walls, Targets, Boxes, "
@@ -1190,7 +1211,7 @@ class ContextManager:
         token_sequences: List[List[int]] = []
         prompt_lengths: List[int] = []
         response_lengths: List[int] = []
-        messages_list: List[List[Dict[str, str]]] = []
+        messages_list: List[List[Dict[str, Any]]] = []
         env_ids: List[int] = []
         group_ids: List[int] = []
         episode_ids: List[int] = []
@@ -1274,6 +1295,10 @@ class ContextManager:
                         ),
                         "judge_force_negative": bool(turn.get("judge_force_negative", False)),
                         "judge_force_reason": str(turn.get("judge_force_reason", "")),
+                        # Machine-readable transition facts are carried beside
+                        # chat content so critics do not have to recover budgets,
+                        # termination, or cycle information from rendered text.
+                        "transition_metadata": deepcopy(turn.get("transition_metadata", {})),
                     },
                 ]
                 after_content = f"Reward:\n{turn.get('reward', 0.0)}\n"

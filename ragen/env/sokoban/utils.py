@@ -4,7 +4,7 @@ import numpy as np
 import marshal
 import copy
 from collections import deque
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -72,96 +72,83 @@ def format_coordinate_render(entity_coords: CoordDict, board_shape: Tuple[int, i
     return "\n".join(lines)
 
 def get_shortest_action_path(room_fixed, room_state, MAX_DEPTH=100):
-        """
-        Get the shortest action path to push all boxes to the target spots.
-        Use BFS to find the shortest path.
-        NOTE currently only support one player, only one shortest solution
-        =========================================================
-        Parameters:
-            room_state (np.ndarray): the state of the room
-                - 0: wall
-                - 1: empty space
-                - 2: box target
-                - 3: box on target
-                - 4: box not on target
-                - 5: player
-            room_fixed (np.ndarray): the fixed part of the room
-                - 0: wall
-                - 1: empty space
-                - 2: box target
-            MAX_DEPTH (int): the maximum depth of the search
-        =========================================================
-        Returns:
-            action_sequence (list): the action sequence to push all boxes to the target spots
-        """
-        
-        # BFS queue stores (room_state, path)
-        queue = deque([(copy.deepcopy(room_state), [])])
-        explored_states = set()
-        
-        # Possible moves: up, down, left, right
-        moves = [(-1,0), (1,0), (0,-1), (0,1)]
-        actions = [1, 2, 3, 4] # Corresponding action numbers
-        
-        while queue:
-            room_state, path = queue.popleft()
-            if len(path) > MAX_DEPTH:
-                return [] # No solution found
+    """Return one shortest Sokoban solution, or ``[]`` when none is found.
 
-            # reduce the search space by checking if the state has been explored
-            state_tohash = marshal.dumps(room_state)
-            if state_tohash in explored_states:
+    Tile values follow gym-sokoban: 3 is a box on a target and 4 is a box
+    off target. Actions 1, 2, 3, and 4 mean up, down, left, and right.
+    """
+    queue = deque([(copy.deepcopy(room_state), [])])
+    explored_states = set()
+    moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    actions = [1, 2, 3, 4]
+
+    while queue:
+        current_state, path = queue.popleft()
+        if MAX_DEPTH is not None and len(path) > MAX_DEPTH:
+            return []
+
+        state_hash = marshal.dumps(current_state)
+        if state_hash in explored_states:
+            continue
+        explored_states.add(state_hash)
+
+        player_positions = np.argwhere(current_state == 5)
+        if player_positions.size == 0:
+            return []
+        player_pos = tuple(player_positions[0])
+        boxes_on_target = set(map(tuple, np.argwhere(current_state == 3)))
+        boxes_not_on_target = set(map(tuple, np.argwhere(current_state == 4)))
+        boxes = boxes_on_target | boxes_not_on_target
+        if not boxes_not_on_target:
+            return path
+
+        for move, action in zip(moves, actions):
+            new_player_pos = (player_pos[0] + move[0], player_pos[1] + move[1])
+            if (
+                new_player_pos[0] < 0
+                or new_player_pos[0] >= room_fixed.shape[0]
+                or new_player_pos[1] < 0
+                or new_player_pos[1] >= room_fixed.shape[1]
+                or room_fixed[new_player_pos] == 0
+            ):
                 continue
-            explored_states.add(state_tohash)
-            
 
-            # get information of the room
-            player_pos = tuple(np.argwhere(room_state == 5)[0])
-            boxes_on_target = set(map(tuple, np.argwhere((room_state == 3))))
-            boxes_not_on_target = set(map(tuple, np.argwhere((room_state == 4))))
-            boxes = boxes_on_target | boxes_not_on_target
-
-
-            # Check if all boxes are on targets
-            if not boxes_not_on_target:
-                return path
-                
-            # Try each direction
-            for move, action in zip(moves, actions):
-                new_room_state = copy.deepcopy(room_state)
-                new_player_pos = (player_pos[0] + move[0], player_pos[1] + move[1])
-                
-                # Check is new player position is wall or out of bound
-                if new_player_pos[0] < 0 or new_player_pos[0] >= room_fixed.shape[0] \
-                    or new_player_pos[1] < 0 or new_player_pos[1] >= room_fixed.shape[1] \
-                    or room_fixed[new_player_pos] == 0:
+            new_room_state = copy.deepcopy(current_state)
+            if new_player_pos in boxes:
+                box_pos = new_player_pos
+                new_box_pos = (new_player_pos[0] + move[0], new_player_pos[1] + move[1])
+                # Check bounds before indexing. Negative NumPy indices would
+                # otherwise wrap around and fabricate a legal push.
+                if (
+                    new_box_pos[0] < 0
+                    or new_box_pos[0] >= room_fixed.shape[0]
+                    or new_box_pos[1] < 0
+                    or new_box_pos[1] >= room_fixed.shape[1]
+                    or room_fixed[new_box_pos] == 0
+                    or new_box_pos in boxes
+                ):
                     continue
-                    
-                # If there's a box, check if we can push it
-                if new_player_pos in boxes:
-                    box_pos = new_player_pos # the original box position
-                    new_box_pos = (new_player_pos[0] + move[0], new_player_pos[1] + move[1])
-                    
-                    # Can't push if hitting wall or another box or out of bound
-                    if room_fixed[new_box_pos] == 0 or new_box_pos in boxes \
-                        or new_box_pos[0] < 0 or new_box_pos[0] >= room_fixed.shape[0] \
-                        or new_box_pos[1] < 0 or new_box_pos[1] >= room_fixed.shape[1]:
-                        continue
-                        
-                    # move the box
-                    
-                    new_room_state[box_pos] = room_fixed[box_pos]
-                    if room_fixed[new_box_pos] == 2:
-                        new_room_state[new_box_pos] = 3
-                    else:
-                        new_room_state[new_box_pos] = 4
-                
-                # player moves
-                new_room_state[player_pos] = room_fixed[player_pos]
-                new_room_state[new_player_pos] = 5
-                queue.append((new_room_state, path + [action]))
-                        
-        return [] # No solution found
+
+                new_room_state[box_pos] = room_fixed[box_pos]
+                new_room_state[new_box_pos] = 3 if room_fixed[new_box_pos] == 2 else 4
+
+            new_room_state[player_pos] = room_fixed[player_pos]
+            new_room_state[new_player_pos] = 5
+            queue.append((new_room_state, path + [action]))
+
+    return []
+
+
+def get_shortest_solution_length(
+    room_fixed: np.ndarray,
+    room_state: np.ndarray,
+    max_depth: Optional[int] = 100,
+) -> Optional[int]:
+    """Return shortest action distance, preserving solved 0 vs no path ``None``."""
+    if not np.any(room_state == 4):
+        return 0
+    path = get_shortest_action_path(room_fixed, room_state, MAX_DEPTH=max_depth)
+    return len(path) if path else None
 
 # def plot_animation(imgs):
 #     fig, ax = plt.subplots()
@@ -287,8 +274,8 @@ def generate_room(dim=(13, 13), p_change_directions=0.35, num_steps=25, num_boxe
     wall = 0
     empty space = 1
     box target = 2
-    box not on target = 3
-    box on target = 4
+    box on target = 3
+    box not on target = 4
     player = 5
 
     :param dim:

@@ -5,6 +5,8 @@ from verl.protocol import DataProto
 
 class DummyTokenizer:
     name_or_path = "qwen"  # or "llama-3" or any string your code expects
+    pad_token_id = 0
+    eos_token_id = 0
 
     def apply_chat_template(self, messages, add_generation_prompt, tokenize):
         return " ".join([msg["content"] for msg in messages])
@@ -167,6 +169,58 @@ def test_prompt_budget_and_single_action_instruction_match_real_rollout(dummy_co
 
     assert ctx.env_config_lookup[0]["max_tokens"] == 40
     assert "exactly one valid action" in ctx.prefix_lookup[0]
+
+
+def test_grid_coord_prefix_deep_merges_nested_environment_config(dummy_config):
+    dummy_config.custom_envs.sokoban.env_config = {
+        "observation_format": "grid_coord",
+        "grid_vocab": {"#": "custom wall"},
+    }
+
+    ctx = ContextManager(config=dummy_config, tokenizer=DummyTokenizer(), mode="train")
+    prefix = ctx.prefix_lookup[0]
+
+    assert "#: custom wall" in prefix
+    assert "X: box" in prefix  # Retained from the dataclass default by deep merge.
+    assert "zero-based indexing" in prefix
+
+
+def test_exact_trace_messages_carry_machine_readable_transition_metadata(dummy_config):
+    ctx = ContextManager(config=dummy_config, tokenizer=DummyTokenizer(), mode="train")
+    transition_metadata = {
+        "state_before": "S1",
+        "state_after": "S2",
+        "actions_left_before": 2,
+        "actions_left_after": 1,
+        "is_cycle": False,
+    }
+    env_outputs = [{
+        "env_id": 0,
+        "group_id": 0,
+        "tag": "sokoban",
+        "history": [
+            {
+                "state": "S1",
+                "actions_left": 2,
+                "llm_response": "<answer>Left</answer>",
+                "llm_raw_response": "<answer>Left</answer>",
+                "executed_action_texts": ["Left"],
+                "prompt_token_ids": [1, 2],
+                "response_token_ids": [3],
+                "reward": -0.1,
+                "transition_metadata": transition_metadata,
+            },
+            {"state": "S2", "actions_left": 1},
+        ],
+        "metrics": {"sokoban/success": 0.0},
+    }]
+
+    samples = ctx._build_samples_from_token_traces(env_outputs)
+    assistant_message = samples.non_tensor_batch["messages_list"][0][2]
+
+    assert assistant_message["transition_metadata"] == transition_metadata
+    assistant_message["transition_metadata"]["actions_left_after"] = 0
+    assert transition_metadata["actions_left_after"] == 1
 
 
 def test_generation_truncation_reserves_the_full_completion_budget(dummy_config):

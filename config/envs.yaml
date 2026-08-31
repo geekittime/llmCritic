@@ -72,11 +72,13 @@ custom_envs:
       1) First, give a detailed rationale grounded in the transition above. You should check the coordinates before and after the action, check whether the action is helpful to push the box towards the target. Note that the player should push the box to the target, only move towards the target is not helpful.
       2) A label based on the rationale above: '###label: True' or '###label: False'. Note that if the actions are neither helpful nor harmful, output '###label: False'.
     score_critic_instruction: |
-      Evaluate progress in Sokoban by future solvability, not merely by Manhattan distance or by whether the player moved.
-      Score +1 when the action makes a correct push, safely reduces the remaining solution effort, or performs a necessary player reposition that measurably improves access to a beneficial push without an offsetting regression.
-      Score -1 for an invalid action, an avoidable no-op, a harmful push, a deadlock, loss of access to the box, or any transition that makes the puzzle less solvable. A push geometrically nearer to the target is still -1 if it creates a deadlock.
-      Score 0 when the meaningful puzzle state and available push plan are unchanged, including reversible player movement that does not improve access, or when gains and regressions genuinely balance.
-      Do not call movement toward a box or target positive unless the resulting state makes a useful future push more achievable.
+      Evaluate future solvability and remaining useful solution effort, not Manhattan distance or player movement alone. Apply these rules in order; the first matching rule wins.
+      1. Score +1 if this transition solves the puzzle. Score -1 if it terminates or exhausts the action budget without solving it.
+      2. Otherwise score -1 for an invalid or ineffective no-op, harmful push, deadlock, loss of access to a box, or an exact increase in shortest solution effort. A push nearer to a target is still -1 if it creates a deadlock.
+      3. If exact before/after solution lengths are available, use them as authoritative local progress: a smaller after-distance is +1 and a larger after-distance is -1. Returning to a previously visited but strictly better state is a +1 recovery for this transition, even if the action is an inverse; cycle frequency is audited separately.
+      4. Without an exact comparison, score +1 only for a beneficial push, a move along a shortest useful route to the required pushing square, or a necessary reposition that demonstrably improves access to the next beneficial push without an offsetting regression.
+      5. Score -1 for an equal/worse repeated state, avoidable cycle, unnecessary inverse/backtrack, harmful move, or finite-budget waste. Score 0 only when strategic value is genuinely equal and the action is effective and non-repeating. Zero is an equality label, never an uncertainty label.
+      Use the before/after grids, coordinates, budget, termination facts, and executed-action facts together. Do not infer progress from prose quality and do not reward merely moving toward a box or target.
     max_tokens: 120
     parallel_friendly: false
     max_workers: 32
