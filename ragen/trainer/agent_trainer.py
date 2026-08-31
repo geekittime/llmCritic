@@ -1012,6 +1012,18 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
         rows: predict {true,false}; cols: target {true,false}
         """
+        if str(self.generative_critic.response_format).lower() in {
+            "score",
+            "score_only",
+            "integer",
+            "integer_score",
+            "deepseek",
+        }:
+            # Trajectory success is not a turn-level ternary target: successful
+            # rollouts can contain bad turns and failed rollouts useful turns.
+            # Reporting a binary confusion matrix here would be misleading and
+            # would spend an extra API batch on every validation pass.
+            return {"gen_critic/eval/confusion/skipped_no_turn_level_targets": 1.0}
         if "messages_list" not in batch.non_tensor_batch:
             return {"gen_critic/eval/confusion/skipped_missing_messages": 1.0}
 

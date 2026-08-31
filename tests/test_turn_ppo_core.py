@@ -10,6 +10,7 @@ from verl.trainer.ppo.core_algos import compute_policy_loss
 
 from ragen.llm_agent.ctx_manager import build_legacy_turn_metadata, build_turn_token_metadata
 from ragen.trainer.agent_trainer import (
+    RayAgentTrainer,
     broadcast_outcome_to_turns,
     collapse_turn_scores,
     compose_turn_advantages,
@@ -26,6 +27,15 @@ from ragen.workers.actor.dp_actor import (
 )
 from ragen.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
 from ragen.utils import redact_config
+
+
+def test_score_only_validation_skips_invalid_binary_confusion_target():
+    trainer = object.__new__(RayAgentTrainer)
+    trainer.generative_critic = SimpleNamespace(response_format="score_only")
+
+    metrics = trainer._compute_critic_confusion_eval_metrics(batch=None)
+
+    assert metrics == {"gen_critic/eval/confusion/skipped_no_turn_level_targets": 1.0}
 
 
 def test_tracker_config_redacts_nested_credentials_without_mutating_input():
