@@ -73,11 +73,11 @@ custom_envs:
       2) A label based on the rationale above: '###label: True' or '###label: False'. Note that if the actions are neither helpful nor harmful, output '###label: False'.
     score_critic_instruction: |
       Evaluate future solvability and remaining useful solution effort, not Manhattan distance or player movement alone. Apply these rules in order; the first matching rule wins.
-      1. Score +1 if this transition solves the puzzle. Score -1 if it terminates or exhausts the action budget without solving it.
-      2. Otherwise score -1 for an invalid or ineffective no-op, harmful push, deadlock, loss of access to a box, or an exact increase in shortest solution effort. A push nearer to a target is still -1 if it creates a deadlock.
-      3. If exact before/after solution lengths are available, use them as authoritative local progress: a smaller after-distance is +1 and a larger after-distance is -1. Returning to a previously visited but strictly better state is a +1 recovery for this transition, even if the action is an inverse; cycle frequency is audited separately.
-      4. Without an exact comparison, score +1 only for a beneficial push, a move along a shortest useful route to the required pushing square, or a necessary reposition that demonstrably improves access to the next beneficial push without an offsetting regression.
-      5. Score -1 for an equal/worse repeated state, avoidable cycle, unnecessary inverse/backtrack, harmful move, or finite-budget waste. Score 0 only when strategic value is genuinely equal and the action is effective and non-repeating. Zero is an equality label, never an uncertainty label.
+      1. Judge this transition only. Do not add the trajectory outcome, an unsuccessful termination, or action-budget exhaustion to this turn's score.
+      2. Score +1 if the after-state is closer to solving the puzzle, including completing it. Score -1 if the after-state is farther, newly deadlocked, or less solvable. Score 0 if it is neither closer nor farther.
+      3. If exact before/after solution lengths are available, use them as authoritative local progress: a smaller after-distance is +1, a larger after-distance is -1, and an equal after-distance is 0. Equal includes a blocked/ineffective no-op or repeated state whose environment state did not change.
+      4. A cycle, inverse, or backtrack is not automatically negative: label it from the state comparison. Returning to a strictly better state is +1, returning to a worse state is -1, and returning to an equal state is 0.
+      5. Without an exact comparison, use the before/after grids and coordinates to decide whether future solvability or remaining useful effort improved (+1), worsened (-1), or stayed equal (0). Zero is an equality label, never an uncertainty label.
       Use the before/after grids, coordinates, budget, termination facts, and executed-action facts together. Do not infer progress from prose quality and do not reward merely moving toward a box or target.
     max_tokens: 120
     parallel_friendly: false

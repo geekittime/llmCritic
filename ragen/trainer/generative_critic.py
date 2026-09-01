@@ -597,19 +597,21 @@ class FrozenGenerativeCritic:
             rubric = critic_instruction.strip() if critic_instruction else ""
             judge_instruction = (
                 "Silently apply this precedence before scoring; do not output the checklist:\n"
-                "1. If the action completes the task, score +1. If it ends the episode unsuccessfully, score -1.\n"
-                "2. Otherwise score -1 for an invalid/ineffective no-op, a deadlock, or an exact solver regression.\n"
+                "1. Judge this transition only. Do not turn the trajectory outcome, an unsuccessful termination, "
+                "or action-budget exhaustion into an extra score for this turn.\n"
+                "2. If the action completes the task, score +1. Score -1 if the after-state is newly deadlocked, "
+                "less solvable, or has a strictly larger exact remaining solution distance.\n"
                 "3. When exact before/after solver distances are available, their relation is authoritative: "
-                "closer means +1 and farther means -1. A cycle or inverse action that returns from a worse state "
-                "to a strictly smaller exact distance is a +1 recovery for this transition; cycle frequency is "
-                "audited separately.\n"
-                "4. Without an exact solver comparison, score +1 only when the transition demonstrably improves "
-                "future solvability: a beneficial push, a move on a shortest useful route, or a necessary reposition.\n"
-                "5. Score -1 for an equal/worse repeated state, avoidable cycle, unnecessary immediate inverse or "
-                "backtrack, harmful transition, or wasted finite action budget.\n"
-                "6. Score 0 only when strategic value is verified equal and the action is effective, non-repeating, "
-                "and causes neither progress nor regression. Never use 0 to express uncertainty; make the best signed "
-                "decision instead.\n"
+                "closer means +1, farther means -1, and equal means 0. This equality rule includes an ineffective "
+                "or blocked no-op and a repeated state because neither state is closer or farther.\n"
+                "4. A cycle or inverse action that reaches a strictly smaller exact distance is +1; one that reaches "
+                "a strictly larger distance is -1; one that returns to an equal-distance state is 0. Cycle frequency "
+                "is audited separately and must not override the transition label.\n"
+                "5. Without an exact solver comparison, score +1 only when the after-state demonstrably improves "
+                "future solvability, and score -1 only when it demonstrably worsens future solvability. Score 0 when "
+                "the states have equal strategic value, including a state-preserving invalid action.\n"
+                "6. Zero is an equality label, not a confidence label. Use the complete transition evidence to make "
+                "the best comparison; do not use 0 merely because facts are missing or difficult to interpret.\n"
             )
             if rubric:
                 judge_instruction += (
@@ -619,10 +621,10 @@ class FrozenGenerativeCritic:
             judge_instruction += (
                 "Authoritative mapping immediately before output:\n"
                 "- solver_progress_relation=closer requires FINAL_SCORE: 1 unless the after-state is deadlocked "
-                "or the episode ended unsuccessfully.\n"
+                "or demonstrably less solvable.\n"
                 "- solver_progress_relation=farther requires FINAL_SCORE: -1.\n"
-                "- solver_progress_relation=equal can never receive +1; use -1 for no-op/repetition/waste and 0 "
-                "only for a genuinely neutral effective transition.\n"
+                "- solver_progress_relation=equal requires FINAL_SCORE: 0, including no-op, repetition, inverse, "
+                "protocol-invalid, and budget-exhausting turns whose environment state is unchanged.\n"
                 "- solver_progress_relation=unknown requires the qualitative rules above.\n"
             )
             judge_instruction += (
@@ -649,7 +651,8 @@ class FrozenGenerativeCritic:
             violation_block = (
                 "\n[Deterministic protocol violation]\n"
                 f"{protocol_violation}\n"
-                "This turn is invalid and its score is fixed to -1.\n"
+                "The sampled response violated the action protocol. Judge the executed state transition only: "
+                "if no environment state changed, the progress label is 0.\n"
             )
 
         return (

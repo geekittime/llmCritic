@@ -122,13 +122,13 @@ def test_score_protocol_prefers_task_specific_integer_rubric():
     assert instruction == "Neutral actions receive integer score 0."
 
 
-def test_coord_sokoban_rubric_has_strict_precedence_and_no_uncertainty_zero():
+def test_coord_sokoban_rubric_preserves_exact_three_way_transition_labels():
     config_path = Path(__file__).resolve().parents[1] / "config" / "envs.yaml"
     rubric = str(OmegaConf.load(config_path).custom_envs.CoordSokoban.score_critic_instruction)
     assert "first matching rule wins" in rubric
-    assert "equal/worse repeated state" in rubric
-    assert "strictly better state is a +1 recovery" in rubric
-    assert "shortest useful route" in rubric
+    assert "an equal after-distance is 0" in rubric
+    assert "blocked/ineffective no-op" in rubric
+    assert "trajectory outcome" in rubric
     assert "Zero is an equality label, never an uncertainty label" in rubric
 
 
@@ -604,7 +604,7 @@ def test_transition_metadata_overrides_legacy_text_and_exposes_decision_facts():
     assert "solver_status_after: solvable" in prompt
     assert "99" not in prompt
     assert "-0.1" not in prompt
-    assert "Never use 0 to express uncertainty" in prompt
+    assert "Zero is an equality label, not a confidence label" in prompt
 
 
 def test_exact_solver_regression_is_rendered_as_authoritative_farther_relation():
@@ -625,6 +625,28 @@ def test_exact_solver_regression_is_rendered_as_authoritative_farther_relation()
     assert "solution_effort_delta: 1.0" in prompt
     assert "solver_progress_relation: farther" in prompt
     assert "solver_progress_relation=farther requires FINAL_SCORE: -1" in prompt
+
+
+def test_exact_solver_equality_requires_neutral_even_for_blocked_noop():
+    critic = FrozenGenerativeCritic(_config())
+    messages = _messages(
+        "Left",
+        transition_metadata={
+            "state_before": "same-state",
+            "state_after": "same-state",
+            "shortest_solution_length_before": 3,
+            "shortest_solution_length_after": 3,
+            "action_is_valid": False,
+            "action_is_effective": False,
+            "action_is_blocked": True,
+            "termination_reason": "max_actions",
+        },
+    )
+
+    prompt = critic.build_judge_prompts([messages], torch.tensor([[0]]))[0].prompt
+    assert "solver_progress_relation: equal" in prompt
+    assert "solver_progress_relation=equal requires FINAL_SCORE: 0" in prompt
+    assert "Do not turn the trajectory outcome" in prompt
 
 
 def test_legacy_transition_text_still_recovers_action_budget():
@@ -775,7 +797,7 @@ def test_deepseek_only_ablation_submits_protocol_violation_to_api():
     critic = FrozenGenerativeCritic(
         _config(force_protocol_violation_score=False, deepseek_cache_enable=False)
     )
-    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: -1")
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: 0")
     critic._deepseek_client = fake
     turn_ids = torch.zeros((1, 2), dtype=torch.long)
 
@@ -791,15 +813,16 @@ def test_deepseek_only_ablation_submits_protocol_violation_to_api():
         turn_ids,
     )
 
-    assert scores.tolist() == [[-1.0, -1.0]]
+    assert scores.tolist() == [[0.0, 0.0]]
     assert metrics["gen_critic/rule_forced_negative_count"] == 0.0
     assert metrics["gen_critic/submitted_prompt_count"] == 1.0
     assert metrics["gen_critic/parse_fail_rate"] == 0.0
-    assert outputs == ["FINAL_SCORE: -1"]
+    assert outputs == ["FINAL_SCORE: 0"]
     assert len(fake.chat.completions.calls) == 1
     request_prompt = fake.chat.completions.calls[0]["messages"][1]["content"]
     assert "max_actions_per_turn_exceeded" in request_prompt
     assert "<answer>Left | Right</answer>" in request_prompt
+    assert "if no environment state changed, the progress label is 0" in request_prompt
 
 
 def test_missing_api_key_preserves_batch_shape_and_reports_failure(monkeypatch):
