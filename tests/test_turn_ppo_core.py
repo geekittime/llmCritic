@@ -78,6 +78,17 @@ def test_turn_label_observability_records_raw_output_and_action_cross_metrics():
                 "state_after": after,
                 "is_cycle": False,
                 "action_is_valid": True,
+                "shortest_solution_length_before": 5,
+                "shortest_solution_length_after": 4,
+                "deadlock_before": False,
+                "deadlock_after": False,
+                "termination": {
+                    "done": False,
+                    "terminated": False,
+                    "truncated": False,
+                    "success": False,
+                    "reason": None,
+                },
             },
         },
         {"role": "user", "content": f"Reward:\n-0.1\nState:\n{after}\nYou have 4 actions left"},
@@ -102,13 +113,88 @@ def test_turn_label_observability_records_raw_output_and_action_cross_metrics():
     assert metrics["train/action_type/move_rate"] == pytest.approx(1.0)
     assert metrics["train/action_label/move_positive_conditional_rate"] == pytest.approx(1.0)
     assert metrics["train/cycle/metadata_available_rate"] == pytest.approx(1.0)
+    assert metrics["train/solver_relation/closer_rate"] == pytest.approx(1.0)
+    assert metrics[
+        "train/solver_relation_label/closer_positive_conditional_rate"
+    ] == pytest.approx(1.0)
     assert records[0]["episode_id"] == 7
     assert records[0]["trajectory_turn_id"] == 2
     assert records[0]["action"] == "Right"
     assert records[0]["action_type"] == "move"
     assert records[0]["parse_valid"] is True
     assert records[0]["raw_output"] == "FINAL_SCORE: 1"
+    assert records[0]["solver_progress_relation"] == "closer"
+    assert records[0]["shortest_solution_length_before"] == 5
+    assert records[0]["shortest_solution_length_after"] == 4
+    assert records[0]["solution_effort_delta"] == -1
+    assert records[0]["deadlock_before"] is False
+    assert records[0]["deadlock_after"] is False
+    assert records[0]["termination_done"] is False
+    assert records[0]["termination_terminated"] is False
+    assert records[0]["termination_truncated"] is False
+    assert records[0]["termination_success"] is False
+    assert records[0]["termination_reason"] is None
     assert len(records[0]["prompt_sha256"]) == 64
+
+
+def test_turn_label_observability_records_farther_terminal_failure():
+    critic = FrozenGenerativeCritic(
+        OmegaConf.create(
+            {
+                "generative_critic": {
+                    "enable": True,
+                    "backend": "deepseek_api",
+                    "response_format": "score_only",
+                    "parse_fail_score": 0,
+                },
+                "custom_envs": {},
+            }
+        )
+    )
+    messages = [
+        {"role": "system", "content": "Solve the puzzle."},
+        {"role": "user", "content": "Turn 1\nState:\nbefore"},
+        {
+            "role": "assistant",
+            "content": "Left",
+            "transition_metadata": {
+                "state_before": "before",
+                "state_after": "after",
+                "shortest_solution_length_before": 4,
+                "shortest_solution_length_after": 5,
+                "deadlock_before": False,
+                "deadlock_after": False,
+                "termination": {
+                    "done": True,
+                    "terminated": False,
+                    "truncated": True,
+                    "success": False,
+                    "reason": "max_actions",
+                },
+            },
+        },
+        {"role": "user", "content": "State:\nafter"},
+    ]
+
+    metrics, records = build_turn_label_observability(
+        critic=critic,
+        messages_list=[messages],
+        turn_ids=torch.tensor([[0, 0]]),
+        label_tensor=torch.tensor([[-1.0, -1.0]]),
+        raw_outputs=["FINAL_SCORE: -1"],
+    )
+
+    assert metrics["train/solver_relation/farther_rate"] == pytest.approx(1.0)
+    assert metrics[
+        "train/solver_relation_label/farther_negative_conditional_rate"
+    ] == pytest.approx(1.0)
+    assert records[0]["solver_progress_relation"] == "farther"
+    assert records[0]["solution_effort_delta"] == 1
+    assert records[0]["termination_done"] is True
+    assert records[0]["termination_terminated"] is False
+    assert records[0]["termination_truncated"] is True
+    assert records[0]["termination_success"] is False
+    assert records[0]["termination_reason"] == "max_actions"
 
 
 def test_action_classifier_separates_push_noop_and_invalid():

@@ -771,6 +771,37 @@ def test_protocol_violation_is_forced_negative_without_api_request():
     assert fake.chat.completions.calls == []
 
 
+def test_deepseek_only_ablation_submits_protocol_violation_to_api():
+    critic = FrozenGenerativeCritic(
+        _config(force_protocol_violation_score=False, deepseek_cache_enable=False)
+    )
+    fake = _FakeClient(lambda kwargs: "FINAL_SCORE: -1")
+    critic._deepseek_client = fake
+    turn_ids = torch.zeros((1, 2), dtype=torch.long)
+
+    scores, metrics, outputs = critic.infer_turn_labels(
+        [
+            _messages(
+                "<no action executed>",
+                raw_content="<answer>Left | Right</answer>",
+                judge_force_negative=True,
+                judge_force_reason="max_actions_per_turn_exceeded",
+            )
+        ],
+        turn_ids,
+    )
+
+    assert scores.tolist() == [[-1.0, -1.0]]
+    assert metrics["gen_critic/rule_forced_negative_count"] == 0.0
+    assert metrics["gen_critic/submitted_prompt_count"] == 1.0
+    assert metrics["gen_critic/parse_fail_rate"] == 0.0
+    assert outputs == ["FINAL_SCORE: -1"]
+    assert len(fake.chat.completions.calls) == 1
+    request_prompt = fake.chat.completions.calls[0]["messages"][1]["content"]
+    assert "max_actions_per_turn_exceeded" in request_prompt
+    assert "<answer>Left | Right</answer>" in request_prompt
+
+
 def test_missing_api_key_preserves_batch_shape_and_reports_failure(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     critic = FrozenGenerativeCritic(

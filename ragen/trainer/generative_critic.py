@@ -216,6 +216,13 @@ class FrozenGenerativeCritic:
         self.include_observed_reward = bool(
             OmegaConf.select(config, "generative_critic.include_observed_reward", default=False)
         )
+        self.force_protocol_violation_score = bool(
+            OmegaConf.select(
+                config,
+                "generative_critic.force_protocol_violation_score",
+                default=True,
+            )
+        )
 
         # API credentials are never embedded in the repository.  A config
         # value is accepted only for backwards compatibility with old local
@@ -694,11 +701,11 @@ class FrozenGenerativeCritic:
                 if assistant_turn_counter in requested_turn_ids:
                     transition = self._extract_transition_context(messages, msg_idx)
                     action_text = str(msg.get("content", ""))
-                    force_negative = bool(msg.get("judge_force_negative", False))
+                    protocol_violation = bool(msg.get("judge_force_negative", False))
                     force_reason = str(msg.get("judge_force_reason", "")).strip()
-                    if force_negative and not force_reason:
+                    if protocol_violation and not force_reason:
                         force_reason = "invalid_or_unexecuted_action"
-                    raw_action_text = msg.get("raw_content", None) if force_negative else None
+                    raw_action_text = msg.get("raw_content", None) if protocol_violation else None
                     raw_action_text = str(raw_action_text) if raw_action_text is not None else None
                     critic_instruction = self._get_task_specific_critic_instruction(transition["env_instruction"])
                     prompt = self._build_single_prompt(
@@ -721,7 +728,11 @@ class FrozenGenerativeCritic:
                             sample_index=sample_index,
                             turn_id=assistant_turn_counter,
                             prompt=prompt,
-                            forced_score=-1 if force_negative else None,
+                            forced_score=(
+                                -1
+                                if protocol_violation and self.force_protocol_violation_score
+                                else None
+                            ),
                             force_reason=force_reason,
                         )
                     )

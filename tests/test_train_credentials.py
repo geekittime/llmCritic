@@ -157,6 +157,15 @@ def test_launcher_uses_neutral_parse_fallback_and_bounded_audit():
     assert "CRITIC_AUDIT_SAMPLE_RATE" in source
     assert "CRITIC_AUDIT_MAX_RECORDS" in source
     assert "TURN_CREDIT_ASSIGNMENT" in source
+    assert 'TOTAL_STEPS="${TOTAL_STEPS:-30}"' in source
+    assert "default_run_name=" in source
+    assert 'default_ray_tmp="/dev/shm/lc-$$"' in source
+    assert "VLLM_MAX_MODEL_LEN" in source
+    assert "VLLM_MAX_NUM_BATCHED_TOKENS" in source
+    assert (
+        '"generative_critic.force_protocol_violation_score='
+        '${FORCE_PROTOCOL_VIOLATION_SCORE:-False}"' in source
+    )
 
 
 def test_config_rejects_environment_budget_larger_than_rollout_capacity():

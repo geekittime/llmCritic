@@ -22,6 +22,7 @@ from tqdm import tqdm
 import time
 from pprint import pprint
 from copy import deepcopy
+from collections.abc import Mapping
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -78,6 +79,7 @@ _AUDIT_SECRET_PATTERNS = (
 
 _ACTION_TYPES = ("invalid", "no_op", "push", "move", "state_change", "unknown")
 _LABEL_NAMES = {-1: "negative", 0: "neutral", 1: "positive"}
+_SOLVER_RELATIONS = ("closer", "equal", "farther", "unknown")
 
 
 def _redact_critic_audit_text(value: Any, *, max_chars: int) -> str:
@@ -91,6 +93,26 @@ def _redact_critic_audit_text(value: Any, *, max_chars: int) -> str:
     if len(text) > max_chars:
         return text[:max_chars] + "...[truncated]"
     return text
+
+
+def _optional_finite_number(value: Any) -> Optional[int | float]:
+    """Return a JSON-safe finite number while preserving missing solver facts."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    """Keep tri-state metadata distinct instead of coercing unknown to false."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return None
 
 
 def _normalise_state_for_comparison(state: Any) -> str:
@@ -299,6 +321,8 @@ def build_turn_label_observability(
     action_label_weights: dict[tuple[str, int], float] = defaultdict(float)
     action_weights: dict[str, float] = defaultdict(float)
     label_weights: dict[int, float] = defaultdict(float)
+    solver_relation_weights: dict[str, float] = defaultdict(float)
+    solver_relation_label_weights: dict[tuple[str, int], float] = defaultdict(float)
     cycle_available_weight = 0.0
     cycle_weight = 0.0
     cycle_label_weights: dict[int, float] = defaultdict(float)
@@ -321,6 +345,17 @@ def build_turn_label_observability(
                 "has_after_state": False,
             }
         )
+        transition_metadata = transition.get("transition_metadata", {})
+        if not isinstance(transition_metadata, Mapping):
+            transition_metadata = {}
+        termination_metadata = transition_metadata.get("termination", {})
+        if not isinstance(termination_metadata, Mapping):
+            termination_metadata = {}
+        solver_relation = str(
+            transition_metadata.get("solver_progress_relation") or "unknown"
+        ).strip().lower()
+        if solver_relation not in _SOLVER_RELATIONS:
+            solver_relation = "unknown"
         action = str(assistant_message.get("content", ""))
         action_type = classify_turn_action(
             action=action,
@@ -336,6 +371,8 @@ def build_turn_label_observability(
         action_weights[action_type] += weight
         action_label_weights[(action_type, label)] += weight
         label_weights[label] += weight
+        solver_relation_weights[solver_relation] += weight
+        solver_relation_label_weights[(solver_relation, label)] += weight
 
         cycle_available, is_cycle = _cycle_metadata(
             critic,
@@ -360,6 +397,9 @@ def build_turn_label_observability(
 
         before_state = str(transition.get("state_before", ""))
         after_state = str(transition.get("state_after", ""))
+        termination_reason = termination_metadata.get(
+            "reason", transition_metadata.get("termination_reason")
+        )
         records.append(
             {
                 "sample_index": sample_index,
@@ -382,6 +422,43 @@ def build_turn_label_observability(
                 "force_reason": _redact_critic_audit_text(item.force_reason, max_chars=256),
                 "cycle_metadata_available": bool(cycle_available),
                 "is_cycle": bool(is_cycle) if cycle_available else None,
+                "solver_progress_relation": solver_relation,
+                "shortest_solution_length_before": _optional_finite_number(
+                    transition_metadata.get("shortest_solution_length_before")
+                ),
+                "shortest_solution_length_after": _optional_finite_number(
+                    transition_metadata.get("shortest_solution_length_after")
+                ),
+                "solution_effort_delta": _optional_finite_number(
+                    transition_metadata.get("solution_effort_delta")
+                ),
+                "deadlock_before": _optional_bool(
+                    transition_metadata.get("deadlock_before")
+                ),
+                "deadlock_after": _optional_bool(
+                    transition_metadata.get("deadlock_after")
+                ),
+                "termination_done": _optional_bool(
+                    termination_metadata.get("done", transition_metadata.get("done"))
+                ),
+                "termination_terminated": _optional_bool(
+                    termination_metadata.get(
+                        "terminated", transition_metadata.get("terminated")
+                    )
+                ),
+                "termination_truncated": _optional_bool(
+                    termination_metadata.get(
+                        "truncated", transition_metadata.get("truncated")
+                    )
+                ),
+                "termination_success": _optional_bool(
+                    termination_metadata.get("success", transition_metadata.get("success"))
+                ),
+                "termination_reason": (
+                    _redact_critic_audit_text(termination_reason, max_chars=256)
+                    if termination_reason is not None
+                    else None
+                ),
                 "observed_reward": _redact_critic_audit_text(
                     transition.get("observed_reward", ""), max_chars=128
                 ),
@@ -412,6 +489,19 @@ def build_turn_label_observability(
             metrics[f"train/action_label/{action_type}_{label_name}_conditional_rate"] = float(
                 joint_weight / action_weight
             ) if action_weight > 0 else 0.0
+    for solver_relation in _SOLVER_RELATIONS:
+        relation_weight = solver_relation_weights[solver_relation]
+        metrics[f"train/solver_relation/{solver_relation}_rate"] = float(
+            relation_weight / denominator
+        )
+        for label, label_name in _LABEL_NAMES.items():
+            joint_weight = solver_relation_label_weights[(solver_relation, label)]
+            metrics[
+                f"train/solver_relation_label/{solver_relation}_{label_name}_rate"
+            ] = float(joint_weight / denominator)
+            metrics[
+                f"train/solver_relation_label/{solver_relation}_{label_name}_conditional_rate"
+            ] = float(joint_weight / relation_weight) if relation_weight > 0 else 0.0
     if cycle_available_weight > 0:
         metrics["train/cycle/rate"] = float(cycle_weight / cycle_available_weight)
         for label, label_name in _LABEL_NAMES.items():

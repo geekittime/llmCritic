@@ -153,6 +153,10 @@ generative_critic:
   # Enable only for an explicitly reward-aware ablation; terminal outcome and
   # shaped environment reward otherwise leak into the judge target.
   include_observed_reward: False
+  # Generic runs may deterministically penalize invalid/unexecuted actions.
+  # The DeepSeek-only launcher disables this so every observed turn is judged
+  # by the API and its advantage is exactly the parsed model output.
+  force_protocol_violation_score: True
   response_format: structured # structured (legacy bool) | score_only (integer -1/0/1)
   # API/format failures are diagnostics, not evidence of progress or regression.
   parse_fail_score: 0

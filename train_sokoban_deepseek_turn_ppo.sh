@@ -84,18 +84,27 @@ if [[ -n "${RAY_WORKER_NICENESS:-}" ]]; then
     # caller-selected normal priority without flooding a shared CPU host.
     export RAY_worker_niceness="${RAY_WORKER_NICENESS}"
 fi
-RUN_NAME="${RUN_NAME:-sokoban-turn-ppo-deepseek-v4-flash}"
+default_run_name="sokoban-turn-ppo-deepseek-v4-flash-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
+RUN_NAME="${RUN_NAME:-${default_run_name}}"
 safe_run_name="$(printf '%s' "${RUN_NAME}" | tr -c 'A-Za-z0-9_.-' '_')"
-if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
+if [[ -d /dev/shm && -w /dev/shm ]]; then
+    # A short, per-launch tmp root avoids Ray socket collisions and keeps
+    # object spilling off a nearly-full data filesystem.
+    default_ray_tmp="/dev/shm/lc-$$"
+elif [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
     # Ray appends a long session/sockets suffix. Keep this root deliberately
     # short so Unix-domain socket paths stay below the platform limit.
     default_ray_tmp="/data/${USER}/rt"
+else
+    default_ray_tmp="/tmp/lc-$$"
+fi
+
+if [[ -d "/data/${USER:-}" && -w "/data/${USER:-}" ]]; then
     default_wandb_dir="/data/${USER}/wb/${safe_run_name}"
     default_tmp_dir="/data/${USER}/tmp/${safe_run_name}"
     default_cache_dir="/data/${USER}/cache"
     default_critic_audit_path="/data/${USER}/logs/llm-critic/${safe_run_name}-critic-audit.jsonl"
 else
-    default_ray_tmp="/tmp/${USER:-ragen}-rt"
     default_wandb_dir="/tmp/${USER:-ragen}-wb/${safe_run_name}"
     default_tmp_dir="/tmp/${USER:-ragen}-tmp/${safe_run_name}"
     default_cache_dir="/tmp/${USER:-ragen}-cache"
@@ -207,7 +216,9 @@ VAL_ENV_GROUPS="${VAL_ENV_GROUPS:-8}"
 VAL_GROUP_SIZE="${VAL_GROUP_SIZE:-4}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
-TOTAL_STEPS="${TOTAL_STEPS:-2000}"
+# This launcher is intended for a bounded validation experiment. Long runs
+# must opt in explicitly after API health and label distributions are checked.
+TOTAL_STEPS="${TOTAL_STEPS:-30}"
 MAX_ACTIONS_PER_TURN="${MAX_ACTIONS_PER_TURN:-1}"
 MAX_ACTIONS_PER_TRAJ="${MAX_ACTIONS_PER_TRAJ:-10}"
 if [[ ! "${MAX_ACTIONS_PER_TURN}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${MAX_ACTIONS_PER_TRAJ}" =~ ^[1-9][0-9]*$ ]]; then
@@ -304,6 +315,8 @@ TRAIN_ARGS=(
     "actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
     "actor_rollout_ref.rollout.enforce_eager=${VLLM_ENFORCE_EAGER:-False}"
+    "actor_rollout_ref.rollout.max_model_len=${VLLM_MAX_MODEL_LEN:-3600}"
+    "actor_rollout_ref.rollout.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
     "actor_rollout_ref.rollout.max_num_seqs=${VLLM_MAX_NUM_SEQS:-1024}"
     "actor_rollout_ref.rollout.free_cache_engine=${FREE_CACHE_ENGINE:-True}"
     "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ:-True}"
@@ -325,6 +338,7 @@ TRAIN_ARGS=(
     "generative_critic.deepseek_max_parse_fail_rate=${DEEPSEEK_MAX_PARSE_FAIL_RATE:-0.25}"
     "generative_critic.deepseek_max_prompt_chars=${DEEPSEEK_MAX_PROMPT_CHARS:-12000}"
     "generative_critic.include_observed_reward=${INCLUDE_OBSERVED_REWARD:-False}"
+    "generative_critic.force_protocol_violation_score=${FORCE_PROTOCOL_VIOLATION_SCORE:-False}"
     "generative_critic.parse_fail_score=0"
     "generative_critic.default_label_if_parse_fail=False"
     "generative_critic.do_sample=False"
